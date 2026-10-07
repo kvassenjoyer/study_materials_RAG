@@ -1,0 +1,50 @@
+services:
+  database:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: study_rag
+      POSTGRES_USER: study_rag
+      POSTGRES_PASSWORD: study_rag
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U study_rag -d study_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  application:
+    profiles: ["application"]
+    build: .
+    env_file: .env
+    environment:
+      STUDY_RAG_DATABASE_URL: postgresql+asyncpg://study_rag:study_rag@database:5432/study_rag
+      STUDY_RAG_QDRANT_URL: http://qdrant:6333
+      STUDY_RAG_OLLAMA_URL: http://host.docker.internal:11434
+      STUDY_RAG_UPLOAD_DIRECTORY: /app/.data/uploads
+      STUDY_RAG_MODEL_CACHE_DIRECTORY: /app/.data/models
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - application-data:/app/.data
+    depends_on:
+      database:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+volumes:
+  postgres-data:
+  qdrant-data:
+  application-data:

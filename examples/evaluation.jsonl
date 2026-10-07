@@ -1,0 +1,5 @@
+{"question_text":"Как выглядит шаг градиентного спуска?","expected_filename":"gradient-descent-ru.md","required_facts":["противоположном градиенту","learning_rate"],"unanswerable":false}
+{"question_text":"Чему равно w после первого шага в примере с w=4?","expected_filename":"gradient-descent-ru.md","required_facts":["3.2"],"unanswerable":false}
+{"question_text":"What is the variance of a Bernoulli random variable?","expected_filename":"probability-en.md","required_facts":["p","1 - p"],"unanswerable":false}
+{"question_text":"When can Bayes' theorem be used in the formula given in the note?","expected_filename":"probability-en.md","required_facts":["P(B) > 0"],"unanswerable":false}
+{"question_text":"В каком кабинете завтра состоится экзамен?","expected_filename":null,"required_facts":[],"unanswerable":true}
