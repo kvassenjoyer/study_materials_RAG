@@ -29,7 +29,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from study_rag.domain.errors import DependencyUnavailableError
 
 
-_REQUIRED_SCHEMA_REVISION: typing.Final = "d9a5c34f126b"
+_REQUIRED_SCHEMA_REVISION: typing.Final = "f1c7e56b348d"
 
 
 @typing.final
@@ -188,8 +188,9 @@ class ChatTurnRow(DatabaseBase):
         ),
         UniqueConstraint("chat_identifier", "client_request_identifier"),
         UniqueConstraint("turn_identifier", "chat_identifier", "tenant_identifier"),
-        CheckConstraint("status_name IN ('pending','completed','failed')", name="status_name"),
+        CheckConstraint("status_name IN ('queued','pending','completed','failed')", name="status_name"),
         Index("ix_turns_chat_status", "chat_identifier", "status_name"),
+        Index("ix_turns_queue", "status_name", "queued_at"),
     )
 
     turn_identifier: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -197,6 +198,9 @@ class ChatTurnRow(DatabaseBase):
     tenant_identifier: Mapped[uuid.UUID]
     client_request_identifier: Mapped[uuid.UUID]
     status_name: Mapped[str] = mapped_column(String(16))
+    queued_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.datetime.now(datetime.UTC)
+    )
     lease_identifier: Mapped[uuid.UUID | None]
     lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(100))
@@ -213,6 +217,7 @@ class ChatMessageRow(DatabaseBase):
         ),
         UniqueConstraint("turn_identifier", "role_name"),
         CheckConstraint("role_name IN ('user','assistant')", name="role_name"),
+        CheckConstraint("response_duration_ms >= 0", name="response_duration_ms"),
         Index("ix_messages_chat_created", "chat_identifier", "created_at"),
     )
 
@@ -224,6 +229,7 @@ class ChatMessageRow(DatabaseBase):
     content_text: Mapped[str] = mapped_column(Text)
     citation_payload: Mapped[list[CitationPayload]] = mapped_column(JSONB, default=list)
     sufficient_context: Mapped[bool | None]
+    response_duration_ms: Mapped[int | None]
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
 
 

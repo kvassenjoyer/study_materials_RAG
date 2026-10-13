@@ -238,6 +238,7 @@ async def test_cancelled_native_write_finishes_before_close(
     native_started = threading.Event()
     native_released = threading.Event()
     close_started = threading.Event()
+    writing_client: QdrantClient | None = None
     original_upsert = QdrantClient.upsert
     original_close = QdrantClient.close
 
@@ -248,13 +249,17 @@ async def test_cancelled_native_write_finishes_before_close(
         points: list[models.PointStruct],  # noqa: COP006 - Qdrant public callback parameter
         wait: bool,  # noqa: COP006 - Qdrant public callback parameter
     ) -> models.UpdateResult:
+        nonlocal writing_client
+        writing_client = vector_client
         native_started.set()
         if not native_released.wait(timeout=5):
             raise TimeoutError("Test did not release the native write")
         return original_upsert(vector_client, collection_name=collection_name, points=points, wait=wait)
 
     def tracked_close(vector_client: QdrantClient) -> None:
-        close_started.set()
+        # GC can close clients retained by earlier tests while this class patch is active.
+        if vector_client is writing_client:
+            close_started.set()
         original_close(vector_client)
 
     monkeypatch.setattr(QdrantClient, "upsert", blocking_upsert)

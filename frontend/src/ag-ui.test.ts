@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiClient } from './api';
+import { ApiClient, errorText } from './api';
 import { startQuestion } from './ag-ui';
 import { RequestScope } from './request-scope';
 import type { QuestionRun } from './types';
@@ -12,7 +12,7 @@ const event = (value: object) => `data: ${JSON.stringify(value)}\n\n`;
 const events = [
   { type: 'RUN_STARTED', threadId: run.chatId, runId: run.runId },
   { type: 'TEXT_MESSAGE_START', messageId: 'assistant-id', role: 'assistant' },
-  { type: 'TEXT_MESSAGE_CONTENT', messageId: 'assistant-id', delta: 'Градиент — вектор частных производных. [S1]' },
+  { type: 'TEXT_MESSAGE_CONTENT', messageId: 'assistant-id', delta: 'Градиент - вектор частных производных. [S1]' },
   { type: 'TEXT_MESSAGE_END', messageId: 'assistant-id' },
   { type: 'RUN_FINISHED', threadId: run.chatId, runId: run.runId },
 ];
@@ -52,6 +52,22 @@ describe('official HttpAgent integration', () => {
     await expect(startQuestion(new ApiClient('token', () => {}, fetcher), 'token', run,
       { isCurrent: () => true, onText: () => {}, onFinished: hydrate }).completion).rejects.toThrow();
     expect(hydrate).not.toHaveBeenCalled();
+  });
+
+  it('preserves a truncation RUN_ERROR for the UI without publishing an assistant answer', async () => {
+    const failure = new Response([
+      event(events[0]), event({ type: 'RUN_ERROR', code: 'model_response_truncated', message: 'Safe backend message' }),
+    ].join(''), { headers: { 'Content-Type': 'text/event-stream' } });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(failure);
+    const text = vi.fn(); const hydrate = vi.fn(async () => {});
+    let caught: unknown;
+    try {
+      await startQuestion(new ApiClient('token', () => {}, fetcher), 'token', run,
+        { isCurrent: () => true, onText: text, onFinished: hydrate }).completion;
+    } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ code: 'model_response_truncated' });
+    expect(errorText(caught)).toContain('Автоматический повтор не помог');
+    expect(text).not.toHaveBeenCalled(); expect(hydrate).not.toHaveBeenCalled();
   });
 
   it('does not apply text or hydration to another chat after a delayed response', async () => {

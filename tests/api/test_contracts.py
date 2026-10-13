@@ -13,6 +13,7 @@ import pytest
 from study_rag.adapters.database import DatabaseResources
 from study_rag.adapters.embeddings import OllamaEmbeddingProvider
 from study_rag.adapters.generation import OllamaAnswerGenerator
+from study_rag.application.answer_queue import AnswerQueue
 from study_rag.application.authentication import AuthenticationService
 from study_rag.application.conversations import ConversationService
 from study_rag.application.documents import DocumentService
@@ -66,6 +67,8 @@ async def api_client(document_service: unittest.mock.Mock) -> typing.AsyncIterat
         embedding_provider=unittest.mock.Mock(spec=OllamaEmbeddingProvider),
         answer_generator=unittest.mock.Mock(spec=OllamaAnswerGenerator),
         worker_task=worker_task,
+        answer_queue=unittest.mock.Mock(spec=AnswerQueue),
+        answer_worker_task=worker_task,
     )
     application: typing.Final = create_application()
     application.state.resources = application_resources

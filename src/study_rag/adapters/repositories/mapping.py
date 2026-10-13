@@ -103,7 +103,9 @@ def citation_record(citation_payload: database.CitationPayload) -> entities.Cita
     )
 
 
-def turn_status(status_name: str) -> typing.Literal["pending", "completed", "failed"]:
+def turn_status(status_name: str) -> entities.TurnStatus:
+    if status_name == "queued":
+        return "queued"
     if status_name == "pending":
         return "pending"
     if status_name == "completed":
@@ -113,7 +115,9 @@ def turn_status(status_name: str) -> typing.Literal["pending", "completed", "fai
     raise ValueError("Invalid persisted turn status")
 
 
-def message_record(message_row: database.ChatMessageRow, status_name: str) -> entities.MessageRecord:
+def message_record(
+    message_row: database.ChatMessageRow, status_name: str, *, error_code: str | None = None
+) -> entities.MessageRecord:
     if message_row.role_name not in ("user", "assistant"):
         raise ValueError("Invalid persisted message role")
     role_name: typing.Literal["user", "assistant"] = "user" if message_row.role_name == "user" else "assistant"
@@ -129,4 +133,6 @@ def message_record(message_row: database.ChatMessageRow, status_name: str) -> en
         sufficient_context=message_row.sufficient_context,
         turn_status=turn_status(status_name),
         created_at=message_row.created_at,
+        turn_error_code=error_code if status_name == "failed" else None,
+        response_duration_ms=message_row.response_duration_ms if role_name == "assistant" else None,
     )

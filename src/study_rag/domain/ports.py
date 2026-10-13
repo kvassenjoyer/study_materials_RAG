@@ -163,7 +163,16 @@ class ConversationRepository(typing.Protocol):
         client_request_identifier: uuid.UUID,
         question_text: str,
         lease_seconds: int,
+        queue_request: bool = False,
     ) -> entities.TurnRecord: ...
+
+    async def claim_queued_turn(self, *, lease_seconds: int) -> entities.ClaimedAnswer | None: ...
+
+    async def fetch_turn(self, *, tenant_identifier: uuid.UUID, turn_identifier: uuid.UUID) -> entities.TurnRecord: ...
+
+    async def list_active_turns(self, *, tenant_identifier: uuid.UUID) -> tuple[entities.AnswerJobRecord, ...]: ...
+
+    async def stop_turn(self, *, tenant_identifier: uuid.UUID, turn_identifier: uuid.UUID) -> entities.TurnRecord: ...
 
     async def complete_turn(
         self,

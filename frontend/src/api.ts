@@ -1,4 +1,4 @@
-import type { AuthToken, ChatRecord, ChunkRecord, DocumentRecord, Identity, MessageRecord, Page, ProjectRecord } from './types';
+import type { AnswerJob, AuthToken, ChatRecord, ChunkRecord, DocumentRecord, Identity, MessageRecord, Page, ProjectRecord, QuestionRun } from './types';
 
 const base = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
 if (base && (!base.startsWith('/') || base.startsWith('//') || /[?#\\]/.test(base))) {
@@ -143,6 +143,13 @@ export class ApiClient {
   }
   messages(chatId: string, signal?: AbortSignal) {
     return this.all<MessageRecord>(`/messages/?chat_identifier=${encodeURIComponent(chatId)}`, signal);
+  }
+  activeAnswers(signal?: AbortSignal) { return this.request<AnswerJob[]>('/answer-jobs/', { signal }); }
+  submitQuestion(request: QuestionRun) {
+    return this.request<AnswerJob>('/answer-jobs/', { method: 'POST', body: JSON.stringify({ chat_identifier: request.chatId, client_request_identifier: request.runId, question_text: request.question }) });
+  }
+  stopAnswer(turnId: string, signal?: AbortSignal) {
+    return this.request<void>(`/answer-jobs/${encodeURIComponent(turnId)}/stop/`, { method: 'POST', signal });
   }
   createChat(projectId: string, signal?: AbortSignal) {
     return this.request<ChatRecord>('/chats/', { method: 'POST', body: JSON.stringify({ project_identifier: projectId }), signal });

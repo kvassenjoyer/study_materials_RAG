@@ -20,10 +20,13 @@ export interface Citation {
 export interface MessageRecord {
   message_identifier: string; chat_identifier: string; turn_identifier: string; role_name: 'user' | 'assistant';
   content_text: string; citation_records: Citation[]; sufficient_context: boolean | null;
-  turn_status: 'pending' | 'completed' | 'failed'; created_at: string;
+  turn_status: 'queued' | 'pending' | 'completed' | 'failed'; created_at: string;
+  turn_error_code: string | null;
+  response_duration_ms: number | null;
 }
 export interface ChunkRecord {
   chunk_identifier: string; document_identifier: string; ordinal_value: number; content_text: string;
   token_count: number; page_start: number | null; page_end: number | null; filename_text: string;
 }
 export interface QuestionRun { chatId: string; runId: string; question: string; messageId: string }
+export interface AnswerJob { turn_identifier: string; chat_identifier: string; project_identifier: string; status_name: MessageRecord['turn_status'] }

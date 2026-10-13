@@ -9,6 +9,7 @@ import datetime
 import os
 import pathlib
 import typing
+import unittest.mock
 import uuid
 
 import pytest
@@ -25,12 +26,331 @@ from study_rag.adapters.repositories import (
 )
 from study_rag.adapters.repositories.projects import PostgreSQLProjectRepository
 from study_rag.api.schemas import DocumentResponse
-from study_rag.domain import entities, errors
+from study_rag.application.answer_queue import AnswerQueue
+from study_rag.application.conversations import ConversationService
+from study_rag.domain import entities, errors, ports
 
 
 pytestmark = pytest.mark.integration
 _MESSAGE_PAIR_SIZE = 2
 _FIXTURE_RESPONSE_DURATION_MS = 1200
+
+
+async def wait_for_turn_status(
+    repository: PostgreSQLConversationRepository,
+    *,
+    tenant_identifier: uuid.UUID,
+    turn_identifier: uuid.UUID,
+    status_name: entities.TurnStatus,
+) -> entities.TurnRecord:
+    async with asyncio.timeout(5):
+        while True:
+            saved_turn = await repository.fetch_turn(
+                tenant_identifier=tenant_identifier, turn_identifier=turn_identifier
+            )
+            if saved_turn.status_name == status_name:
+                return saved_turn
+            await asyncio.sleep(0.01)
+
+
+async def test_answer_queue_fifo_idempotence_ownership_and_stop(repository_harness: "RepositoryHarness") -> None:
+    owner_account = await create_test_account(repository_harness)
+    other_account = await create_test_account(repository_harness)
+    repository = repository_harness.conversation_repository
+    first_chat = await repository.create_chat(tenant_identifier=owner_account.user_identifier)
+    project_repository = PostgreSQLProjectRepository(session_factory=repository_harness.session_factory)
+    other_project = await project_repository.create_project(
+        tenant_identifier=owner_account.user_identifier, title_text="Physics"
+    )
+    second_chat = await repository.create_chat(
+        tenant_identifier=owner_account.user_identifier, project_identifier=other_project.project_identifier
+    )
+    foreign_chat = await repository.create_chat(tenant_identifier=other_account.user_identifier)
+    queued_turns = [
+        await repository.begin_turn(
+            tenant_identifier=chat_record.tenant_identifier,
+            chat_identifier=chat_record.chat_identifier,
+            client_request_identifier=uuid.uuid4(),
+            question_text="Question",
+            lease_seconds=60,
+            queue_request=True,
+        )
+        for chat_record in (first_chat, second_chat, foreign_chat)
+    ]
+    first_turn, second_turn, foreign_turn = queued_turns
+    assert first_turn.lease_identifier is None
+    assert (
+        await repository.begin_turn(
+            tenant_identifier=owner_account.user_identifier,
+            chat_identifier=first_chat.chat_identifier,
+            client_request_identifier=first_turn.client_request_identifier,
+            question_text="Question",
+            lease_seconds=60,
+            queue_request=True,
+        )
+        == first_turn
+    )
+    with pytest.raises(errors.ResourceConflictError, match="already being generated"):
+        await repository.begin_turn(
+            tenant_identifier=owner_account.user_identifier,
+            chat_identifier=first_chat.chat_identifier,
+            client_request_identifier=uuid.uuid4(),
+            question_text="Another question",
+            lease_seconds=60,
+            queue_request=True,
+        )
+    with pytest.raises(errors.ResourceConflictError, match="another question"):
+        await repository.begin_turn(
+            tenant_identifier=owner_account.user_identifier,
+            chat_identifier=first_chat.chat_identifier,
+            client_request_identifier=first_turn.client_request_identifier,
+            question_text="Changed",
+            lease_seconds=60,
+            queue_request=True,
+        )
+    active_turns = await repository.list_active_turns(tenant_identifier=owner_account.user_identifier)
+    assert [one_turn.turn_identifier for one_turn in active_turns] == [
+        first_turn.turn_identifier,
+        second_turn.turn_identifier,
+    ]
+    assert active_turns[1].project_identifier == other_project.project_identifier
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository.stop_turn(
+            tenant_identifier=owner_account.user_identifier, turn_identifier=foreign_turn.turn_identifier
+        )
+    # Queue waiting has no lease deadline, even after a long wait.
+    async with repository_harness.session_factory.begin() as database_session:
+        await database_session.execute(
+            update(database.ChatTurnRow)
+            .where(database.ChatTurnRow.turn_identifier == first_turn.turn_identifier)
+            .values(queued_at=datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1))
+        )
+    claimed_values = await asyncio.gather(
+        repository.claim_queued_turn(lease_seconds=60), repository.claim_queued_turn(lease_seconds=60)
+    )
+    claimed_answers = [claimed_value for claimed_value in claimed_values if claimed_value is not None]
+    assert len(claimed_answers) == 1
+    claimed_answer = claimed_answers[0]
+    assert claimed_answer.turn_record.turn_identifier == first_turn.turn_identifier
+    assert claimed_answer.tenant_identity.user_identifier == owner_account.user_identifier
+    stopped_queued = await repository.stop_turn(
+        tenant_identifier=owner_account.user_identifier, turn_identifier=second_turn.turn_identifier
+    )
+    assert stopped_queued.user_message.turn_error_code == "answer_stopped"
+    assert await repository.claim_queued_turn(lease_seconds=60) is None
+    await repository.stop_turn(
+        tenant_identifier=owner_account.user_identifier, turn_identifier=first_turn.turn_identifier
+    )
+    with pytest.raises(errors.LeaseLostError):
+        await repository.complete_turn(
+            tenant_identifier=owner_account.user_identifier,
+            turn_record=claimed_answer.turn_record,
+            generated_answer=entities.GeneratedAnswer(
+                answer_text="Late answer", sufficient_context=False, citation_identifiers=()
+            ),
+            citation_records=(),
+        )
+    next_answer = await repository.claim_queued_turn(lease_seconds=60)
+    assert next_answer is not None
+    assert next_answer.turn_record.turn_identifier == foreign_turn.turn_identifier
+    history_page = await repository.list_messages(
+        tenant_identifier=owner_account.user_identifier,
+        chat_identifier=first_chat.chat_identifier,
+        limit_count=50,
+        offset_value=0,
+    )
+    assert history_page.total_count == 1
+    assert history_page.items[0].turn_error_code == "answer_stopped"
+
+
+async def test_queue_survives_subscriber_disconnect_and_executes_serially(
+    repository_harness: "RepositoryHarness",
+) -> None:
+    owner_account = await create_test_account(repository_harness)
+    tenant_identity = entities.TenantIdentity(
+        user_identifier=owner_account.user_identifier, login_name=owner_account.login_name
+    )
+    repository = repository_harness.conversation_repository
+    first_chat = await repository.create_chat(tenant_identifier=owner_account.user_identifier)
+    second_chat = await repository.create_chat(tenant_identifier=owner_account.user_identifier)
+    first_started, second_started = asyncio.Event(), asyncio.Event()
+    release_first, release_second = asyncio.Event(), asyncio.Event()
+    execution_order: list[uuid.UUID] = []
+
+    async def execute_answer(
+        *, tenant_identity: entities.TenantIdentity, turn_record: entities.TurnRecord
+    ) -> entities.AnswerRecord:
+        execution_order.append(turn_record.chat_identifier)
+        if turn_record.chat_identifier == first_chat.chat_identifier:
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+            await release_second.wait()
+        return await repository.complete_turn(
+            tenant_identifier=tenant_identity.user_identifier,
+            turn_record=turn_record,
+            generated_answer=entities.GeneratedAnswer(
+                answer_text="Answer",
+                sufficient_context=False,
+                citation_identifiers=(),
+                response_duration_ms=_FIXTURE_RESPONSE_DURATION_MS,
+            ),
+            citation_records=(),
+        )
+
+    service_mock = unittest.mock.Mock(spec=ConversationService)
+    service_mock.turn_lease_seconds = 60
+    service_mock.execute_reserved_turn.side_effect = execute_answer
+    answer_queue = AnswerQueue(conversation_repository=repository, conversation_service=service_mock, poll_seconds=0.01)
+    first_turn = await answer_queue.submit_question(
+        tenant_identity=tenant_identity,
+        chat_identifier=first_chat.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="First",
+    )
+    second_turn = await answer_queue.submit_question(
+        tenant_identity=tenant_identity,
+        chat_identifier=second_chat.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="Second",
+    )
+    # Recreating the queue service demonstrates that accepted jobs live in PostgreSQL.
+    restarted_queue = dataclasses.replace(answer_queue)
+    worker_task = asyncio.create_task(restarted_queue.run_worker())
+    observer_task = asyncio.create_task(
+        answer_queue.answer_question(
+            tenant_identity=tenant_identity,
+            chat_identifier=first_chat.chat_identifier,
+            client_request_identifier=first_turn.client_request_identifier,
+            question_text="First",
+        )
+    )
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=5)
+        assert not second_started.is_set()
+        observer_task.cancel()
+        await asyncio.gather(observer_task, return_exceptions=True)
+        still_pending = await repository.fetch_turn(
+            tenant_identifier=owner_account.user_identifier, turn_identifier=first_turn.turn_identifier
+        )
+        assert still_pending.status_name == "pending"
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), timeout=5)
+        assert execution_order == [first_chat.chat_identifier, second_chat.chat_identifier]
+        release_second.set()
+        saved_second = await wait_for_turn_status(
+            repository,
+            tenant_identifier=owner_account.user_identifier,
+            turn_identifier=second_turn.turn_identifier,
+            status_name="completed",
+        )
+        assert saved_second.assistant_message is not None
+        assert saved_second.assistant_message.response_duration_ms == _FIXTURE_RESPONSE_DURATION_MS
+        replayed_answer = await answer_queue.answer_question(
+            tenant_identity=tenant_identity,
+            chat_identifier=first_chat.chat_identifier,
+            client_request_identifier=first_turn.client_request_identifier,
+            question_text="First",
+        )
+        assert replayed_answer.assistant_message.content_text == "Answer"
+        assert service_mock.execute_reserved_turn.await_count == _MESSAGE_PAIR_SIZE
+        assert not await repository.list_active_turns(tenant_identifier=owner_account.user_identifier)
+    finally:
+        observer_task.cancel()
+        worker_task.cancel()
+        await asyncio.gather(observer_task, worker_task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("stop_action", ["stop", "delete_chat", "delete_project"])
+async def test_stop_or_deletion_cancels_model_and_releases_queue(
+    repository_harness: "RepositoryHarness", stop_action: str
+) -> None:
+    owner_account = await create_test_account(repository_harness)
+    tenant_identity = entities.TenantIdentity(
+        user_identifier=owner_account.user_identifier, login_name=owner_account.login_name
+    )
+    repository = repository_harness.conversation_repository
+    first_chat = await repository.create_chat(tenant_identifier=owner_account.user_identifier)
+    project_repository = PostgreSQLProjectRepository(session_factory=repository_harness.session_factory)
+    other_project = await project_repository.create_project(
+        tenant_identifier=owner_account.user_identifier, title_text="Surviving project"
+    )
+    second_chat = await repository.create_chat(
+        tenant_identifier=owner_account.user_identifier, project_identifier=other_project.project_identifier
+    )
+    started_event, cancelled_event = asyncio.Event(), asyncio.Event()
+
+    async def execute_answer(
+        *, tenant_identity: entities.TenantIdentity, turn_record: entities.TurnRecord
+    ) -> entities.AnswerRecord:
+        if turn_record.chat_identifier == first_chat.chat_identifier:
+            started_event.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await repository.fail_turn(
+                    tenant_identifier=tenant_identity.user_identifier,
+                    turn_record=turn_record,
+                    error_code="answer_cancelled",
+                )
+                cancelled_event.set()
+                raise
+        return await repository.complete_turn(
+            tenant_identifier=tenant_identity.user_identifier,
+            turn_record=turn_record,
+            generated_answer=entities.GeneratedAnswer(
+                answer_text="Next answer", sufficient_context=False, citation_identifiers=()
+            ),
+            citation_records=(),
+        )
+
+    service_mock = unittest.mock.Mock(spec=ConversationService)
+    service_mock.turn_lease_seconds = 60
+    service_mock.execute_reserved_turn.side_effect = execute_answer
+    answer_queue = AnswerQueue(conversation_repository=repository, conversation_service=service_mock, poll_seconds=0.01)
+    first_turn = await answer_queue.submit_question(
+        tenant_identity=tenant_identity,
+        chat_identifier=first_chat.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="First",
+    )
+    second_turn = await answer_queue.submit_question(
+        tenant_identity=tenant_identity,
+        chat_identifier=second_chat.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="Second",
+    )
+    worker_task = asyncio.create_task(answer_queue.run_worker())
+    try:
+        await asyncio.wait_for(started_event.wait(), timeout=5)
+        if stop_action == "stop":
+            await repository.stop_turn(
+                tenant_identifier=owner_account.user_identifier, turn_identifier=first_turn.turn_identifier
+            )
+        elif stop_action == "delete_chat":
+            await repository.delete_chat(
+                tenant_identifier=owner_account.user_identifier, chat_identifier=first_chat.chat_identifier
+            )
+        else:
+            await project_repository.delete_project(
+                tenant_identifier=owner_account.user_identifier, project_identifier=first_chat.project_identifier
+            )
+        await asyncio.wait_for(cancelled_event.wait(), timeout=5)
+        await wait_for_turn_status(
+            repository,
+            tenant_identifier=owner_account.user_identifier,
+            turn_identifier=second_turn.turn_identifier,
+            status_name="completed",
+        )
+        if stop_action == "stop":
+            saved_turn = await repository.fetch_turn(
+                tenant_identifier=owner_account.user_identifier, turn_identifier=first_turn.turn_identifier
+            )
+            assert saved_turn.user_message.turn_error_code == "answer_stopped"
+    finally:
+        worker_task.cancel()
+        await asyncio.gather(worker_task, return_exceptions=True)
 
 
 @typing.final
@@ -41,6 +361,77 @@ class RepositoryHarness:
     auth_repository: PostgreSQLAuthRepository
     document_repository: PostgreSQLDocumentRepository
     conversation_repository: PostgreSQLConversationRepository
+
+
+@pytest.mark.parametrize("failure_code", ["model_unavailable", "answer_timeout"])
+async def test_generation_failure_does_not_block_next_answer(
+    repository_harness: RepositoryHarness, failure_code: str
+) -> None:
+    owner_account = await create_test_account(repository_harness)
+    tenant_identity = entities.TenantIdentity(
+        user_identifier=owner_account.user_identifier, login_name=owner_account.login_name
+    )
+    repository = repository_harness.conversation_repository
+    first_chat = await repository.create_chat(tenant_identifier=owner_account.user_identifier)
+    second_chat = await repository.create_chat(tenant_identifier=owner_account.user_identifier)
+    answer_generator = unittest.mock.AsyncMock(spec=ports.AnswerGenerator)
+    request_count = 0
+
+    async def generate_answer(**_request_fields: object) -> entities.GeneratedAnswer:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            if failure_code == "answer_timeout":
+                await asyncio.Event().wait()
+            raise errors.DependencyUnavailableError(error_code=failure_code, message_text="Model failed")
+        return entities.GeneratedAnswer(answer_text="Привет!", sufficient_context=False, citation_identifiers=())
+
+    answer_generator.generate_answer.side_effect = generate_answer
+    conversation_service = ConversationService(
+        conversation_repository=repository,
+        document_repository=unittest.mock.AsyncMock(spec=ports.DocumentRepository),
+        embedding_provider=unittest.mock.AsyncMock(spec=ports.EmbeddingProvider),
+        vector_store=unittest.mock.AsyncMock(spec=ports.VectorStore),
+        answer_generator=answer_generator,
+        answer_timeout_seconds=0.3,
+    )
+    answer_queue = AnswerQueue(
+        conversation_repository=repository, conversation_service=conversation_service, poll_seconds=0.01
+    )
+    first_turn = await answer_queue.submit_question(
+        tenant_identity=tenant_identity,
+        chat_identifier=first_chat.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="Привет!",
+    )
+    second_turn = await answer_queue.submit_question(
+        tenant_identity=tenant_identity,
+        chat_identifier=second_chat.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="Привет!",
+    )
+    worker_task = asyncio.create_task(answer_queue.run_worker())
+    try:
+        failed_turn = await wait_for_turn_status(
+            repository,
+            tenant_identifier=owner_account.user_identifier,
+            turn_identifier=first_turn.turn_identifier,
+            status_name="failed",
+        )
+        assert failed_turn.user_message.turn_error_code == failure_code
+        assert failed_turn.assistant_message is None
+        saved_turn = await wait_for_turn_status(
+            repository,
+            tenant_identifier=owner_account.user_identifier,
+            turn_identifier=second_turn.turn_identifier,
+            status_name="completed",
+        )
+        assert saved_turn.assistant_message is not None
+        assert saved_turn.assistant_message.response_duration_ms is not None
+        assert "Привет!" in saved_turn.assistant_message.content_text
+    finally:
+        worker_task.cancel()
+        await asyncio.gather(worker_task, return_exceptions=True)
 
 
 @typing.final
@@ -1034,6 +1425,7 @@ async def test_failed_index_retry_preserves_no_false_ready(repository_harness: R
 
 
 async def test_turn_concurrency_retry_and_replay(repository_harness: RepositoryHarness) -> None:
+    expected_duration = 3250
     user_account = await create_test_account(repository_harness)
     chat_record = await repository_harness.conversation_repository.create_chat(
         tenant_identifier=user_account.user_identifier, title_text="Biology"
@@ -1055,13 +1447,22 @@ async def test_turn_concurrency_retry_and_replay(repository_harness: RepositoryH
         )
     assert (
         await repository_harness.conversation_repository.fetch_history(
-            tenant_identifier=user_account.user_identifier, chat_identifier=chat_record.chat_identifier, message_limit=8
+            tenant_identifier=user_account.user_identifier,
+            chat_identifier=chat_record.chat_identifier,
+            message_limit=8,
         )
         == ()
     )
     await repository_harness.conversation_repository.fail_turn(
         tenant_identifier=user_account.user_identifier, turn_record=first_turn, error_code="model_unavailable"
     )
+    failed_messages = await repository_harness.conversation_repository.list_messages(
+        tenant_identifier=user_account.user_identifier,
+        chat_identifier=chat_record.chat_identifier,
+        limit_count=50,
+        offset_value=0,
+    )
+    assert failed_messages.items[0].turn_error_code == "model_unavailable"
     retried_turn = await repository_harness.conversation_repository.begin_turn(
         tenant_identifier=user_account.user_identifier,
         chat_identifier=chat_record.chat_identifier,
@@ -1070,6 +1471,7 @@ async def test_turn_concurrency_retry_and_replay(repository_harness: RepositoryH
         lease_seconds=300,
     )
     assert retried_turn.user_message.message_identifier == first_turn.user_message.message_identifier
+    assert retried_turn.user_message.turn_error_code is None
     with pytest.raises(errors.LeaseLostError):
         await repository_harness.conversation_repository.complete_turn(
             tenant_identifier=user_account.user_identifier,
@@ -1086,7 +1488,10 @@ async def test_turn_concurrency_retry_and_replay(repository_harness: RepositoryH
         tenant_identifier=user_account.user_identifier,
         turn_record=retried_turn,
         generated_answer=entities.GeneratedAnswer(
-            answer_text="Insufficient context", sufficient_context=False, citation_identifiers=()
+            answer_text="Insufficient context",
+            sufficient_context=False,
+            citation_identifiers=(),
+            response_duration_ms=expected_duration,
         ),
         citation_records=(),
     )
@@ -1101,6 +1506,7 @@ async def test_turn_concurrency_retry_and_replay(repository_harness: RepositoryH
 
     assert replayed_turn.status_name == "completed"
     assert replayed_turn.assistant_message == completed_answer.assistant_message
+    assert completed_answer.assistant_message.response_duration_ms == expected_duration
     message_page = await repository_harness.conversation_repository.list_messages(
         tenant_identifier=user_account.user_identifier,
         chat_identifier=chat_record.chat_identifier,
@@ -1109,6 +1515,9 @@ async def test_turn_concurrency_retry_and_replay(repository_harness: RepositoryH
     )
     assert message_page.total_count == _MESSAGE_PAIR_SIZE
     assert [one_message_record.role_name for one_message_record in message_page.items] == ["user", "assistant"]
+    assert message_page.items[0].response_duration_ms is None
+    assert message_page.items[1].response_duration_ms == expected_duration
+    assert all(one_message_record.turn_error_code is None for one_message_record in message_page.items)
     assert (
         len(
             await repository_harness.conversation_repository.fetch_history(
@@ -1177,6 +1586,10 @@ async def test_expired_turn_cannot_complete_after_new_request(repository_harness
         offset_value=0,
     )
     assert [one_message_record.turn_status for one_message_record in message_page.items] == ["failed", "pending"]
+    assert [one_message_record.turn_error_code for one_message_record in message_page.items] == [
+        "turn_lease_expired",
+        None,
+    ]
 
 
 async def test_citation_snapshot_survives_document_deletion(repository_harness: RepositoryHarness) -> None:

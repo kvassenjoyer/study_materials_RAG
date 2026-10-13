@@ -1,16 +1,17 @@
-import { startQuestion } from './ag-ui';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { DragEvent, KeyboardEvent } from 'react';
-import { documentFailureText, errorText, isAbort } from './api';
+import { documentFailureText, errorText, isAbort, turnFailureText } from './api';
 import type { ApiClient } from './api';
 import { RequestScope } from './request-scope';
-import type { ChatRecord, Citation, DocumentRecord, Identity, MessageRecord, QuestionRun, ProjectRecord } from './types';
+import type { AnswerJob, ChatRecord, Citation, DocumentRecord, Identity, MessageRecord, QuestionRun, ProjectRecord } from './types';
 import { Icon } from './components/Icon';
 import { Markdown } from './components/Markdown';
 import { SourceDialog, Sources } from './components/Sources';
 import { ProjectSwitcher } from './components/ProjectSwitcher';
 import { ManagementDialog } from './components/ManagementDialog';
 import { IndexingProgress } from './components/IndexingProgress';
+import { AnswerDuration } from './components/AnswerDuration';
+import { AnswerStatus, answerStatusText } from './components/AnswerStatus';
 
 const date = (value: string) => new Intl.DateTimeFormat('ru', { day: 'numeric', month: 'short' }).format(new Date(value));
 const fileSize = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} МБ` : `${Math.max(1, Math.round(bytes / 1024))} КБ`;
@@ -55,7 +56,7 @@ export function Workspace({ api, token, identity, onLogout }: { api: ApiClient; 
     project={project} projects={projects} {...projectActions}/>
 }
 
-function ProjectWorkspace({ api, token, identity, onLogout, project, projects, onSelectProject, onProjectCreated, onProjectUpdated, onProjectDeleted }: {
+function ProjectWorkspace({ api, identity, onLogout, project, projects, onSelectProject, onProjectCreated, onProjectUpdated, onProjectDeleted }: {
   api: ApiClient; token: string; identity: Identity; onLogout: () => void;
   project: ProjectRecord; projects: ProjectRecord[]; onSelectProject: (id: string) => void; onProjectCreated: (project: ProjectRecord) => void;
   onProjectUpdated: (project: ProjectRecord) => void; onProjectDeleted: (id: string) => void;
@@ -77,6 +78,10 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
   const [run, setRun] = useState<ActiveRun | null>(null);
   const [failedRun, setFailedRun] = useState<QuestionRun | null>(null);
   const [runError, setRunError] = useState('');
+  const [answerJobs, setAnswerJobs] = useState<AnswerJob[]>([]);
+  const answerJobsRef = useRef<AnswerJob[]>([]);
+  const [queueError, setQueueError] = useState('');
+  const [stoppingAnswer, setStoppingAnswer] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [creatingChat, setCreatingChat] = useState(false);
   const [chatMenu, setChatMenu] = useState<string | null>(null);
@@ -121,6 +126,7 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
 
   const selectChat = useCallback((id: string) => {
     scope.current.select(id); selectedChat.current = id;
+    setStoppingAnswer(false);
     setChatId(id); setMessages([]); setRun(null); setFailedRun(null); setRunError(''); setQuestion('');
     setCitation(null); setSidebarOpen(false);
     void loadHistory(id).catch(() => {});
@@ -163,6 +169,34 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
     };
   }, [loadChats, loadDocuments]);
 
+  const loadAnswers = useCallback(async () => {
+    const current = scope.current.session();
+    const selection = scope.current.selection();
+    const id = selectedChat.current;
+    try {
+      const jobs = await tracked(signal => api.activeAnswers(signal));
+      if (!current()) return;
+      const previous = answerJobsRef.current;
+      answerJobsRef.current = jobs; setAnswerJobs(jobs); setQueueError('');
+      const unfinishedHistory = messagesRef.current.some(message => message.chat_identifier === id && ['queued', 'pending'].includes(message.turn_status));
+      if (id && selection() && (unfinishedHistory || [...jobs, ...previous].some(job => job.chat_identifier === id))) {
+        await loadHistory(id, false);
+      }
+      if (previous.some(job => !jobs.some(next => next.turn_identifier === job.turn_identifier))) void loadChats();
+    } catch (error) { if (current() && !isAbort(error)) setQueueError(errorText(error)); }
+  }, [api, tracked, loadHistory, loadChats]);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: number;
+    const poll = async () => {
+      await loadAnswers();
+      if (!stopped) timer = window.setTimeout(() => void poll(), 1000);
+    };
+    void poll();
+    return () => { stopped = true; window.clearTimeout(timer); };
+  }, [loadAnswers]);
+
   const hasPendingDocuments = documents.some(item => ['queued', 'indexing', 'deleting'].includes(item.state_name));
   useEffect(() => {
     if (!hasPendingDocuments) return;
@@ -183,7 +217,7 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
 
   function newChat() {
     scope.current.select(null); selectedChat.current = null;
-    historyRequest.current?.abort();
+    historyRequest.current?.abort(); setStoppingAnswer(false);
     setChatId(null); setMessages([]); setRun(null); setFailedRun(null); setRunError(''); setQuestion('');
     setHistoryLoading(false); setHistoryError(''); setCitation(null); setSidebarOpen(false); setChatMenu(null);
     window.requestAnimationFrame(() => textarea.current?.focus());
@@ -217,7 +251,7 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
 
   async function sendQuestion(retry?: QuestionRun) {
     let id = selectedChat.current; const text = retry?.question ?? question.trim();
-    if (startingChat.current || run || !text || text.length > 4000 || historyLoading) return;
+    if (startingChat.current || run || activeAnswer || !text || text.length > 4000 || historyLoading) return;
     if (!id) {
       startingChat.current = true; setCreatingChat(true); setRunError('');
       const selection = scope.current.selection(); const session = scope.current.session();
@@ -233,12 +267,15 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
     const request: QuestionRun = retry ?? { chatId: id, runId: crypto.randomUUID(), messageId: crypto.randomUUID(), question: text };
     const current = scope.current.selection();
     setRun({ request, text: '', knownMessages: new Set(messages.map(message => message.message_identifier)) }); setQuestion(''); setRunError(''); setFailedRun(null);
+    const session = scope.current.session();
     try {
-      await startQuestion(api, token, request, {
-        isCurrent: current,
-        onText: text => setRun(previous => previous?.request.runId === request.runId ? { ...previous, text } : previous),
-        onFinished: async () => { await loadHistory(id, false); if (current()) void loadChats(); },
-      }).completion;
+      // Submission survives navigation too; only observation depends on the selected chat.
+      const job = await api.submitQuestion(request);
+      if (!session()) return;
+      answerJobsRef.current = [...answerJobsRef.current.filter(item => item.turn_identifier !== job.turn_identifier), job];
+      setAnswerJobs(answerJobsRef.current);
+      if (current()) await loadHistory(id, false);
+      void loadChats(); void loadAnswers();
     }
     catch (error) {
       if (!current()) return;
@@ -249,6 +286,17 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
     } finally {
       if (current()) { setRun(null); textarea.current?.focus(); }
     }
+  }
+
+  async function stopAnswer() {
+    if (!activeAnswer || stoppingAnswer) return;
+    const current = scope.current.selection(); setStoppingAnswer(true); setRunError('');
+    try {
+      await api.stopAnswer(activeAnswer.turn_identifier);
+      await loadAnswers();
+      if (current() && chatId) await loadHistory(chatId, false);
+    } catch (error) { if (current()) setRunError(errorText(error)); }
+    finally { if (current()) setStoppingAnswer(false); }
   }
 
   function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -262,6 +310,10 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
   }
 
   const activeChat = chats.find(item => item.chat_identifier === chatId);
+  const pendingMessage = messages.find(item => item.role_name === 'user' && ['queued', 'pending'].includes(item.turn_status));
+  const activeAnswer = answerJobs.find(job => job.chat_identifier === chatId && ['queued', 'pending'].includes(job.status_name))
+    ?? (pendingMessage ? { turn_identifier: pendingMessage.turn_identifier, status_name: pendingMessage.turn_status } : null);
+  const activeStatus = activeAnswer?.status_name === 'queued' ? 'queued' : 'pending';
   const persistedRun = run && messages.some(item => item.role_name === 'assistant' && !run.knownMessages.has(item.message_identifier));
   const optimisticQuestion = run && !messages.some(item => item.role_name === 'user' && !run.knownMessages.has(item.message_identifier));
 
@@ -279,7 +331,7 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
       <section className="chat-section"><div className="section-heading"><h2>Чаты</h2><span>{chats.length}</span></div>
         {listLoading ? <p className="sidebar-empty" role="status">Загружаю чаты…</p> : chats.length ? <nav className="chat-list" aria-label="История чатов">{chats.map(chat => <div className="chat-row" key={chat.chat_identifier}><button
           className={`chat-item ${chat.chat_identifier === chatId ? 'selected' : ''}`} aria-current={chat.chat_identifier === chatId ? 'page' : undefined}
-          onClick={() => { setChatMenu(null); selectChat(chat.chat_identifier); }}><Icon name="chat" size={18}/><span><span className="chat-name">{chat.title_text}</span><span className="chat-date">{date(chat.updated_at)}</span></span></button>
+          onClick={() => { setChatMenu(null); selectChat(chat.chat_identifier); }}><Icon name="chat" size={18}/><span><span className="chat-name">{chat.title_text}</span>{answerJobs.some(job => job.chat_identifier === chat.chat_identifier && ['queued', 'pending'].includes(job.status_name)) ? <AnswerStatus status={answerJobs.find(job => job.chat_identifier === chat.chat_identifier)?.status_name === 'queued' ? 'queued' : 'pending'}/> : <span className="chat-date">{date(chat.updated_at)}</span>}</span></button>
           <button className="icon-button chat-more" aria-label={`Действия чата ${chat.title_text}`} aria-expanded={chatMenu === chat.chat_identifier} onClick={() => setChatMenu(current => current === chat.chat_identifier ? null : chat.chat_identifier)}><Icon name="more" size={17}/></button>
           {chatMenu === chat.chat_identifier && <div className="chat-actions"><button onClick={() => { setChatMenu(null); setChatAction({ kind: 'rename', chat }); }}><Icon name="edit" size={14}/>Переименовать</button>
             <button className="danger-text" onClick={() => { setChatMenu(null); setChatAction({ kind: 'delete', chat }); }}><Icon name="trash" size={14}/>Удалить</button></div>}
@@ -318,21 +370,21 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
         {!chatId && <p className="new-chat-hint">Задайте первый вопрос ниже - чат создастся автоматически</p>}
         {<div className="suggestion-list">{['Объясни основную идею материала', 'Какие понятия нужно запомнить?', 'Приведи пример из моего конспекта'].map(text => <button key={text} onClick={() => { setQuestion(text); textarea.current?.focus(); }}>{text}<Icon name="chevron" size={14}/></button>)}</div>}
       </section> : <div className="messages">{messages.map(message => <article className={`message ${message.role_name}`} key={message.message_identifier}>
-        <div className="message-heading"><span className={`message-avatar ${message.role_name}`}>{message.role_name === 'assistant' ? <Icon name="spark" size={17}/> : identity.login_name.slice(0, 1).toUpperCase()}</span><strong>{message.role_name === 'assistant' ? 'Помощник' : 'Вы'}</strong><span className="message-time">{new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit' }).format(new Date(message.created_at))}</span></div>
-        <div className="message-body"><Markdown text={message.content_text}/>{message.role_name === 'user' && message.turn_status === 'failed' && <span className="turn-state failed">Ответ не был получен. Попробуйте повторить запрос</span>}
+        <div className="message-heading"><span className={`message-avatar ${message.role_name}`}>{message.role_name === 'assistant' ? <Icon name="spark" size={17}/> : identity.login_name.slice(0, 1).toUpperCase()}</span><strong>{message.role_name === 'assistant' ? 'Помощник' : 'Вы'}</strong>{message.role_name === 'assistant' && <AnswerDuration milliseconds={message.response_duration_ms}/>}<span className="message-time">{new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit' }).format(new Date(message.created_at))}</span></div>
+        <div className="message-body"><Markdown text={message.content_text}/>{message.role_name === 'user' && message.turn_status === 'failed' && <span className="turn-state failed">{turnFailureText(message.turn_error_code)}</span>}
           {message.role_name === 'assistant' && <Sources citations={message.citation_records} onOpen={setCitation}/>}</div>
       </article>)}
       {optimisticQuestion && run && <article className="message user"><div className="message-heading"><span className="message-avatar user">{identity.login_name.slice(0, 1).toUpperCase()}</span><strong>Вы</strong></div><div className="message-body"><Markdown text={run.request.question}/></div></article>}
-      {(run && !persistedRun) && <article className="message assistant pending-response"><div className="message-heading"><span className="message-avatar assistant"><Icon name="spark" size={17}/></span><strong>{'Помощник'}</strong></div><div className="message-body"><p className="loading-line" role="status"><span className="spinner"/>{run?.text || 'Готовлю ответ…'}</p></div></article>}
+      {(activeAnswer || (run && !persistedRun)) && <article className="message assistant pending-response"><div className="message-heading"><span className="message-avatar assistant"><Icon name="spark" size={17}/></span><strong>{'Помощник'}</strong></div><div className="message-body"><p className="loading-line" role="status"><span className="spinner"/>{activeAnswer ? answerStatusText(activeStatus) : 'Отправляю вопрос…'}</p>{activeStatus === 'queued' && <p className="queue-hint">Запрос начнётся, когда модель освободится. Можно перейти в другой чат или проект</p>}</div></article>}
       </div>}
       {historyError && <div className="history-error"><p className="alert" role="alert">{historyError}</p><button className="text-button" onClick={() => chatId && void loadHistory(chatId).catch(() => {})}>Обновить историю</button></div>}
       <div ref={end}/>
     </div>
-    <footer className="composer-area">{runError && <div className="run-error"><p role="alert">{runError}</p>{failedRun && <button className="text-button" disabled={!!run || historyLoading} onClick={() => void sendQuestion(failedRun)}><Icon name="retry" size={14}/>Повторить запрос</button>}</div>}
+    <footer className="composer-area">{queueError && <p className="alert" role="alert">Не удаётся обновить статус запроса. {queueError}. Принятый запрос продолжает выполняться на сервере</p>}{runError && <div className="run-error"><p role="alert">{runError}</p>{failedRun && <button className="text-button" disabled={!!run || !!activeAnswer || historyLoading} onClick={() => void sendQuestion(failedRun)}><Icon name="retry" size={14}/>Повторить запрос</button>}</div>}
       <form className="composer" onSubmit={event => { event.preventDefault(); void sendQuestion(failedRun && question.trim() === failedRun.question ? failedRun : undefined); }}>
-        <label className="visually-hidden" htmlFor="question">Ваш вопрос</label><textarea ref={textarea} id="question" placeholder={chatId ? 'Что хотите узнать?' : 'Задайте вопрос, чтобы начать новый чат…'} value={question} maxLength={4000} rows={2} disabled={creatingChat || !!run || historyLoading || listLoading}
+        <label className="visually-hidden" htmlFor="question">Ваш вопрос</label><textarea ref={textarea} id="question" placeholder={chatId ? 'Что хотите узнать?' : 'Задайте вопрос, чтобы начать новый чат…'} value={question} maxLength={4000} rows={2} disabled={creatingChat || !!run || !!activeAnswer || historyLoading || listLoading}
           onChange={event => { setQuestion(event.target.value); setFailedRun(null); setRunError(''); }} onKeyDown={onComposerKey}/>
-        <button className="send-button" type="submit" disabled={creatingChat || !question.trim() || !!run || historyLoading || listLoading} aria-label="Отправить вопрос">{run || creatingChat ? <span className="spinner"/> : <Icon name="arrow" size={21}/>}</button>
+        {activeAnswer ? <button className="stop-answer-button" type="button" onClick={() => void stopAnswer()} disabled={stoppingAnswer}><span aria-hidden="true">■</span>{stoppingAnswer ? 'Останавливаю…' : 'Остановить'}</button> : <button className="send-button" type="submit" disabled={creatingChat || !question.trim() || !!run || historyLoading || listLoading} aria-label="Отправить вопрос">{run || creatingChat ? <span className="spinner"/> : <Icon name="arrow" size={21}/>}</button>}
       </form><div className="composer-foot"><span>Enter - отправить · Shift + Enter - новая строка</span><span>{question.length ? `${question.length} / 4000` : 'Проверяйте важные детали по источникам'}</span></div>
     </footer></main>
     {citation && <SourceDialog key={citation.chunk_identifier} api={api} citation={citation} onClose={() => setCitation(null)}/>}

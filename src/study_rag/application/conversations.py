@@ -139,10 +139,23 @@ class ConversationService:
                 user_message=turn_record.user_message,
                 assistant_message=turn_record.assistant_message,
             )
+        return await self.execute_reserved_turn(
+            tenant_identity=tenant_identity, turn_record=turn_record, question_text=normalized_question
+        )
+
+    async def execute_reserved_turn(
+        self,
+        *,
+        tenant_identity: entities.TenantIdentity,
+        turn_record: entities.TurnRecord,
+        question_text: str | None = None,
+    ) -> entities.AnswerRecord:
         try:
             async with asyncio.timeout(self.answer_timeout_seconds):
                 return await self._answer_reserved_turn(
-                    tenant_identity=tenant_identity, turn_record=turn_record, question_text=normalized_question
+                    tenant_identity=tenant_identity,
+                    turn_record=turn_record,
+                    question_text=turn_record.user_message.content_text if question_text is None else question_text,
                 )
         except TimeoutError as timeout_error:
             await self._fail_reserved_turn(
@@ -265,10 +278,13 @@ class ConversationService:
             generated_answer = dataclasses.replace(
                 generated_answer, answer_text=f"> {knowledge_notice}\n\n{generated_answer.answer_text.strip()}"
             )
+        timed_answer = dataclasses.replace(
+            generated_answer, response_duration_ms=max(0, round((time.monotonic() - started_at) * 1000))
+        )
         return await self.conversation_repository.complete_turn(
             tenant_identifier=tenant_identity.user_identifier,
             turn_record=turn_record,
-            generated_answer=generated_answer,
+            generated_answer=timed_answer,
             citation_records=citation_records,
         )
 

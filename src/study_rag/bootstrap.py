@@ -22,6 +22,7 @@ from study_rag.adapters.repositories.projects import PostgreSQLProjectRepository
 from study_rag.adapters.security import ArgonPasswordSecurity, JwtAccessTokenCodec
 from study_rag.adapters.tokenizer import HuggingFaceTokenizer
 from study_rag.adapters.vector_store import QdrantVectorStore
+from study_rag.application.answer_queue import AnswerQueue
 from study_rag.application.authentication import AuthenticationService
 from study_rag.application.conversations import ConversationService
 from study_rag.application.documents import DocumentService
@@ -45,9 +46,11 @@ class ApplicationResources:
     embedding_provider: OllamaEmbeddingProvider | HuggingFaceEmbeddingProvider
     answer_generator: OllamaAnswerGenerator
     worker_task: asyncio.Task[None]
+    answer_queue: AnswerQueue
+    answer_worker_task: asyncio.Task[None]
 
     async def check_readiness(self) -> bool:
-        if self.worker_task.done():
+        if self.worker_task.done() or self.answer_worker_task.done():
             return False
         readiness_results: typing.Final = await asyncio.gather(
             self.database_resources.check_readiness(),
@@ -201,6 +204,11 @@ async def initialize_resources(*, settings: Settings | None = None) -> typing.As
         )
         worker_task: typing.Final = asyncio.create_task(ingestion_worker.run_worker(), name="study-rag-ingestion")
         resource_stack.push_async_callback(stop_worker_task, ingestion_worker=ingestion_worker, worker_task=worker_task)
+        answer_queue = AnswerQueue(
+            conversation_repository=conversation_repository, conversation_service=conversation_service
+        )
+        answer_worker_task = asyncio.create_task(answer_queue.run_worker(), name="study-rag-answer-queue")
+        resource_stack.push_async_callback(stop_answer_worker, worker_task=answer_worker_task)
         application_resources: typing.Final = ApplicationResources(
             settings=configured_settings,
             authentication_service=authentication_service,
@@ -215,11 +223,18 @@ async def initialize_resources(*, settings: Settings | None = None) -> typing.As
             embedding_provider=embedding_provider,
             answer_generator=answer_generator,
             worker_task=worker_task,
+            answer_queue=answer_queue,
+            answer_worker_task=answer_worker_task,
         )
         yield application_resources
 
 
 async def stop_worker_task(*, ingestion_worker: IngestionWorker, worker_task: asyncio.Task[None]) -> None:
     ingestion_worker.stop_worker()
+    worker_task.cancel()
+    await asyncio.gather(worker_task, return_exceptions=True)
+
+
+async def stop_answer_worker(*, worker_task: asyncio.Task[None]) -> None:
     worker_task.cancel()
     await asyncio.gather(worker_task, return_exceptions=True)

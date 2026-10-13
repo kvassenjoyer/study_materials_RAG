@@ -16,6 +16,7 @@ import starlette.types
 from ag_ui import core as agui_core
 
 from study_rag.api import ag_ui, dependencies
+from study_rag.application.answer_queue import AnswerQueue
 from study_rag.application.authentication import AuthenticationService
 from study_rag.application.conversations import ConversationService
 from study_rag.bootstrap import ApplicationResources
@@ -73,6 +74,8 @@ async def agent_scenario() -> typing.AsyncIterator[AgentApiScenario]:
     resource_bundle: typing.Final = unittest.mock.Mock(spec=ApplicationResources)
     resource_bundle.authentication_service = authentication_service
     resource_bundle.conversation_service = conversation_service
+    resource_bundle.answer_queue = unittest.mock.Mock(spec=AnswerQueue)
+    resource_bundle.answer_queue.answer_question = conversation_service.answer_question
 
     def provide_resources() -> ApplicationResources:
         return resource_bundle
@@ -310,6 +313,14 @@ async def test_safelisted_content_type_is_rejected_before_body(agent_scenario: A
             "Another request is using this chat",
         ),
         (RuntimeError("internal traceback sentinel"), "agent_run_failed", "Agent run failed; retry this request"),
+        (
+            errors.DependencyUnavailableError(
+                error_code="model_response_truncated",
+                message_text="The model reached its output limit again after one automatic retry.",
+            ),
+            "model_response_truncated",
+            "The model reached its output limit again after one automatic retry.",
+        ),
     ],
 )
 async def test_stream_failure_has_safe_protocol_error_and_no_success(
@@ -335,7 +346,7 @@ async def test_stream_failure_has_safe_protocol_error_and_no_success(
     assert "internal traceback sentinel" not in response_value.text
 
 
-async def test_request_cancellation_reaches_conversation_service(agent_scenario: AgentApiScenario) -> None:
+async def test_request_cancellation_closes_queue_waiter(agent_scenario: AgentApiScenario) -> None:
     started_event: typing.Final = asyncio.Event()
     cancelled_event: typing.Final = asyncio.Event()
 
@@ -364,27 +375,27 @@ async def test_request_cancellation_reaches_conversation_service(agent_scenario:
     await asyncio.wait_for(cancelled_event.wait(), timeout=3)
 
 
-async def test_disconnected_stream_fails_reserved_turn_without_success(agent_scenario: AgentApiScenario) -> None:
+async def test_disconnected_stream_preserves_queued_turn_without_success(agent_scenario: AgentApiScenario) -> None:
     started_event: typing.Final = asyncio.Event()
     disconnected_event: typing.Final = asyncio.Event()
     turn_record: typing.Final = entities.TurnRecord(
         turn_identifier=agent_scenario.answer_record.turn_identifier,
         chat_identifier=agent_scenario.answer_record.chat_identifier,
         client_request_identifier=uuid.UUID(agent_scenario.agent_request.run_id),
-        status_name="pending",
-        lease_identifier=uuid.uuid4(),
-        user_message=dataclasses.replace(agent_scenario.answer_record.user_message, turn_status="pending"),
+        status_name="queued",
+        lease_identifier=None,
+        user_message=dataclasses.replace(agent_scenario.answer_record.user_message, turn_status="queued"),
         assistant_message=None,
     )
     conversation_repository: typing.Final = unittest.mock.AsyncMock(spec=ports.ConversationRepository)
     conversation_repository.begin_turn.return_value = turn_record
 
-    async def blocked_history(**_request_fields: object) -> tuple[entities.MessageRecord, ...]:
+    async def blocked_status(**_request_fields: object) -> entities.TurnRecord:
         started_event.set()
         await asyncio.Event().wait()
-        return ()
+        return turn_record
 
-    conversation_repository.fetch_history.side_effect = blocked_history
+    conversation_repository.fetch_turn.side_effect = blocked_status
     conversation_service: typing.Final = ConversationService(
         conversation_repository=conversation_repository,
         document_repository=unittest.mock.AsyncMock(spec=ports.DocumentRepository),
@@ -392,7 +403,10 @@ async def test_disconnected_stream_fails_reserved_turn_without_success(agent_sce
         vector_store=unittest.mock.AsyncMock(spec=ports.VectorStore),
         answer_generator=unittest.mock.AsyncMock(spec=ports.AnswerGenerator),
     )
-    agent_scenario.conversation_service.answer_question.side_effect = conversation_service.answer_question
+    answer_queue = AnswerQueue(
+        conversation_repository=conversation_repository, conversation_service=conversation_service, poll_seconds=0.01
+    )
+    agent_scenario.conversation_service.answer_question.side_effect = answer_queue.answer_question
     emitted_messages: typing.Final[list[starlette.types.Message]] = []
     request_body: typing.Final = agent_scenario.agent_request.model_dump_json(by_alias=True).encode()
     emitted_request = False
@@ -430,11 +444,15 @@ async def test_disconnected_stream_fails_reserved_turn_without_success(agent_sce
     disconnected_event.set()
     await asyncio.wait_for(application_task, timeout=3)
 
-    conversation_repository.fail_turn.assert_awaited_once_with(
+    conversation_repository.begin_turn.assert_awaited_once_with(
         tenant_identifier=agent_scenario.tenant_identity.user_identifier,
-        turn_record=turn_record,
-        error_code="answer_cancelled",
+        chat_identifier=turn_record.chat_identifier,
+        client_request_identifier=turn_record.client_request_identifier,
+        question_text=turn_record.user_message.content_text,
+        lease_seconds=conversation_service.turn_lease_seconds,
+        queue_request=True,
     )
+    conversation_repository.fail_turn.assert_not_awaited()
     conversation_repository.complete_turn.assert_not_awaited()
     emitted_payload: typing.Final = b"".join(response_message.get("body", b"") for response_message in emitted_messages)
     assert b"RUN_STARTED" in emitted_payload

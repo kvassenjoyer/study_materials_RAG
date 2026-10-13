@@ -325,13 +325,62 @@ async def answer_question(
     tenant_identity: dependencies.CurrentIdentity,
     application_resources: dependencies.CurrentResources,
 ) -> schemas.AnswerResponse:
-    answer_record: typing.Final = await application_resources.conversation_service.answer_question(
+    answer_record: typing.Final = await application_resources.answer_queue.answer_question(
         tenant_identity=tenant_identity,
         chat_identifier=question_request.chat_identifier,
         client_request_identifier=question_request.client_request_identifier,
         question_text=question_request.question_text,
     )
     return schemas.AnswerResponse.model_validate(answer_record)
+
+
+@api_router.post("/answer-jobs/", response_model=schemas.AnswerJobResponse, status_code=202, tags=["chats"])
+async def submit_answer(
+    *,
+    question_request: schemas.QuestionRequest,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> schemas.AnswerJobResponse:
+    turn_record = await application_resources.answer_queue.submit_question(
+        tenant_identity=tenant_identity,
+        chat_identifier=question_request.chat_identifier,
+        client_request_identifier=question_request.client_request_identifier,
+        question_text=question_request.question_text,
+    )
+    chat_record = await application_resources.conversation_service.fetch_chat(
+        tenant_identity=tenant_identity, chat_identifier=turn_record.chat_identifier
+    )
+    return schemas.AnswerJobResponse(
+        turn_identifier=turn_record.turn_identifier,
+        chat_identifier=turn_record.chat_identifier,
+        project_identifier=chat_record.project_identifier,
+        status_name=turn_record.status_name,
+    )
+
+
+@api_router.get("/answer-jobs/", response_model=tuple[schemas.AnswerJobResponse, ...], tags=["chats"])
+async def list_active_answers(
+    *,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> tuple[schemas.AnswerJobResponse, ...]:
+    active_turns = await application_resources.answer_queue.conversation_repository.list_active_turns(
+        tenant_identifier=tenant_identity.user_identifier
+    )
+    return tuple(schemas.AnswerJobResponse.model_validate(turn_record) for turn_record in active_turns)
+
+
+@api_router.post("/answer-jobs/{turn_identifier}/stop/", status_code=204, tags=["chats"])
+async def stop_answer(
+    *,
+    turn_identifier: uuid.UUID,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> fastapi.Response:
+    await application_resources.answer_queue.conversation_repository.stop_turn(
+        tenant_identifier=tenant_identity.user_identifier, turn_identifier=turn_identifier
+    )
+    return fastapi.Response(status_code=204)
 
 
 @api_router.post("/projects/", response_model=schemas.ProjectResponse, status_code=201, tags=["projects"])

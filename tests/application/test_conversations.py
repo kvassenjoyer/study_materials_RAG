@@ -114,6 +114,7 @@ def scenario_context() -> ScenarioContext:
             sufficient_context=generated_answer.sufficient_context,
             turn_status="completed",
             created_at=recorded_timestamp,
+            response_duration_ms=generated_answer.response_duration_ms,
         )
         return entities.AnswerRecord(
             turn_identifier=turn_record.turn_identifier,
@@ -190,6 +191,47 @@ async def test_no_materials_persist_general_answer_with_notice(scenario_context:
         context_chunks=(),
     )
     scenario_context.embedding_provider.embed_question.assert_not_awaited()
+
+
+async def test_preparation_duration_uses_monotonic_time_of_current_attempt(scenario_context: ScenarioContext) -> None:
+    expected_milliseconds = 3250
+    with unittest.mock.patch("study_rag.application.conversations.time") as preparation_clock:
+        preparation_clock.monotonic.side_effect = [100.0, 103.25]
+        answer_record = await scenario_context.conversation_service.answer_question(
+            tenant_identity=scenario_context.tenant_identity,
+            chat_identifier=scenario_context.turn_record.chat_identifier,
+            client_request_identifier=scenario_context.turn_record.client_request_identifier,
+            question_text="Explain gradient descent",
+        )
+    assert answer_record.assistant_message.response_duration_ms == expected_milliseconds
+    assert answer_record.user_message.response_duration_ms is None
+    assert scenario_context.answer_generator.generate_answer.return_value.response_duration_ms is None
+
+
+async def test_completed_replay_keeps_saved_duration_without_starting_a_new_timer(
+    scenario_context: ScenarioContext,
+) -> None:
+    saved_duration = 225046
+    assistant_message = dataclasses.replace(
+        scenario_context.turn_record.user_message,
+        role_name="assistant",
+        turn_status="completed",
+        content_text="Saved answer",
+        response_duration_ms=saved_duration,
+    )
+    scenario_context.conversation_repository.begin_turn.return_value = dataclasses.replace(
+        scenario_context.turn_record, status_name="completed", assistant_message=assistant_message
+    )
+    with unittest.mock.patch("study_rag.application.conversations.time") as preparation_clock:
+        answer_record = await scenario_context.conversation_service.answer_question(
+            tenant_identity=scenario_context.tenant_identity,
+            chat_identifier=scenario_context.turn_record.chat_identifier,
+            client_request_identifier=scenario_context.turn_record.client_request_identifier,
+            question_text="Explain gradient descent",
+        )
+    assert answer_record.assistant_message.response_duration_ms == saved_duration
+    preparation_clock.monotonic.assert_not_called()
+    scenario_context.answer_generator.generate_answer.assert_not_awaited()
 
 
 async def test_citation_subset_keeps_original_source_label(scenario_context: ScenarioContext) -> None:

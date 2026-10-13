@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiClient, ApiError, errorText } from './api';
+import { ApiClient, ApiError, errorText, turnFailureText } from './api';
 
 describe('REST transport', () => {
   it('loads original PDFs with bearer headers and page metadata without putting credentials in the URL', async () => {
@@ -87,5 +87,49 @@ describe('REST transport', () => {
     await expect(client.deleteProject('project-id')).resolves.toBeUndefined();
     await client.createChat('project-id');
     expect(JSON.parse(String(fetcher.mock.calls[2][1]?.body))).toEqual({ project_identifier: 'project-id' });
+  });
+});
+
+describe('answer failures', () => {
+  it('distinguishes explicit stop from a connection interruption', () => {
+    expect(turnFailureText('answer_stopped')).toBe('Вы остановили подготовку ответа');
+    expect(turnFailureText('answer_cancelled')).not.toBe(turnFailureText('answer_stopped'));
+  });
+  it.each(['model_response_truncated', 'incomplete_model_response', 'model_request_timeout', 'model_unavailable', 'unknown_answer_citation', 'invalid_evidence_review'])('shows the same meaningful reason for a live and persisted %s failure', code => {
+    const message = errorText(new ApiError(503, code, 'private backend details'));
+    expect(message).toBe(turnFailureText(code));
+    expect(message).not.toContain('private backend details');
+    expect(message).not.toBe('Сервис временно недоступен. Попробуйте позже');
+  });
+
+  it('explains truncation after retry and suggests splitting the question', () => {
+    expect(turnFailureText('model_response_truncated')).toContain('Автоматический повтор не помог');
+    expect(turnFailureText('model_response_truncated')).toContain('Разбейте вопрос');
+  });
+
+  it('uses a safe fallback for missing and unknown persisted error codes', () => {
+    expect(turnFailureText(null)).toBe(turnFailureText('unknown_internal_failure'));
+    expect(turnFailureText(undefined)).toContain('Попробуйте повторить запрос');
+  });
+});
+
+describe('background answers', () => {
+  it('submits once with a stable id, observes jobs and explicitly stops by turn id', async () => {
+    const accepted = { turn_identifier: 'turn-id', chat_identifier: 'chat-id', project_identifier: 'project-id', status_name: 'queued' };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(accepted, { status: 202 }))
+      .mockResolvedValueOnce(Response.json([accepted]))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const api = new ApiClient('test-bearer', () => {}, fetcher);
+    const request = { chatId: 'chat-id', runId: 'stable-request-id', messageId: 'message-id', question: 'Explain queues' };
+    expect(await api.submitQuestion(request)).toEqual(accepted);
+    expect(await api.activeAnswers()).toEqual([accepted]);
+    await expect(api.stopAnswer('turn-id')).resolves.toBeUndefined();
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual(['/rest/study-rag/answer-jobs/', '/rest/study-rag/answer-jobs/', '/rest/study-rag/answer-jobs/turn-id/stop/']);
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toEqual({ chat_identifier: 'chat-id', client_request_identifier: 'stable-request-id', question_text: 'Explain queues' });
+    // Navigation cannot abort an accepted submission; stop is a distinct authenticated POST.
+    expect(fetcher.mock.calls[0][1]?.signal).toBeUndefined();
+    expect(fetcher.mock.calls[2][1]?.method).toBe('POST');
+    expect(new Headers(fetcher.mock.calls[2][1]?.headers).get('Authorization')).toBe('Bearer test-bearer');
   });
 });

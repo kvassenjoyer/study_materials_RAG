@@ -133,6 +133,8 @@ class MessageResponse(ResponseModel):
     sufficient_context: bool | None
     turn_status: entities.TurnStatus
     created_at: datetime.datetime
+    turn_error_code: str | None = None
+    response_duration_ms: int | None = pydantic.Field(default=None, ge=0)
 
 
 @typing.final
@@ -149,6 +151,14 @@ class AnswerResponse(ResponseModel):
     chat_identifier: uuid.UUID
     user_message: MessageResponse
     assistant_message: MessageResponse
+
+
+@typing.final
+class AnswerJobResponse(ResponseModel):
+    turn_identifier: uuid.UUID
+    chat_identifier: uuid.UUID
+    project_identifier: uuid.UUID
+    status_name: entities.TurnStatus
 
 
 @typing.final

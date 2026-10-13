@@ -10,7 +10,23 @@ import uuid
 type EmbeddingVector = tuple[float, ...]
 type Vector = EmbeddingVector
 type MessageRole = typing.Literal["user", "assistant"]
-type TurnStatus = typing.Literal["pending", "completed", "failed"]
+type TurnStatus = typing.Literal["queued", "pending", "completed", "failed"]
+
+
+@typing.final
+@dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
+class AnswerJobRecord:
+    turn_identifier: uuid.UUID
+    chat_identifier: uuid.UUID
+    project_identifier: uuid.UUID
+    status_name: TurnStatus
+
+
+@typing.final
+@dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
+class ClaimedAnswer:
+    tenant_identity: "TenantIdentity"
+    turn_record: "TurnRecord"
 
 
 @typing.final
@@ -221,6 +237,8 @@ class MessageRecord:
     sufficient_context: bool | None
     turn_status: TurnStatus
     created_at: datetime.datetime
+    turn_error_code: str | None = None
+    response_duration_ms: int | None = None
 
 
 @typing.final
@@ -241,6 +259,7 @@ class GeneratedAnswer:
     answer_text: str
     sufficient_context: bool
     citation_identifiers: tuple[uuid.UUID, ...]
+    response_duration_ms: int | None = None
 
 
 @typing.final

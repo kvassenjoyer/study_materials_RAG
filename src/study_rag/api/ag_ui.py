@@ -14,6 +14,7 @@ from pydantic_ai.ui.ag_ui import AGUIAdapter, AGUIEventStream
 from starlette.responses import StreamingResponse
 
 from study_rag.api import dependencies, schemas
+from study_rag.application.answer_queue import AnswerQueue
 from study_rag.application.conversations import ConversationService
 from study_rag.domain import entities, errors
 
@@ -34,7 +35,7 @@ class ValidatedAgentRequest:
 @typing.final
 @dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
 class ConversationModelBridge:
-    conversation_service: ConversationService
+    answer_queue: AnswerQueue
     tenant_identity: entities.TenantIdentity
     question_request: schemas.QuestionRequest
 
@@ -43,7 +44,7 @@ class ConversationModelBridge:
         _model_messages: list[pydantic_ai.messages.ModelMessage],
         _agent_information: function_model.AgentInfo,
     ) -> typing.AsyncIterator[str]:
-        answer_record: typing.Final = await self.conversation_service.answer_question(
+        answer_record: typing.Final = await self.answer_queue.answer_question(
             tenant_identity=self.tenant_identity,
             chat_identifier=self.question_request.chat_identifier,
             client_request_identifier=self.question_request.client_request_identifier,
@@ -84,6 +85,7 @@ class StudyAGUIAdapter(AGUIAdapter[None, str]):
 @dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
 class AgentRunEndpoint:
     conversation_service: ConversationService
+    answer_queue: AnswerQueue
 
     async def build_response(
         self, *, http_request: fastapi.Request, tenant_identity: entities.TenantIdentity
@@ -96,7 +98,7 @@ class AgentRunEndpoint:
             chat_identifier=validated_request.question_request.chat_identifier,
         )
         model_bridge: typing.Final = ConversationModelBridge(
-            conversation_service=self.conversation_service,
+            answer_queue=self.answer_queue,
             tenant_identity=tenant_identity,
             question_request=validated_request.question_request,
         )
@@ -188,6 +190,6 @@ async def run_agent(
     tenant_identity: dependencies.CurrentIdentity,
     application_resources: dependencies.CurrentResources,
 ) -> StreamingResponse:
-    return await AgentRunEndpoint(conversation_service=application_resources.conversation_service).build_response(
-        http_request=http_request, tenant_identity=tenant_identity
-    )
+    return await AgentRunEndpoint(
+        conversation_service=application_resources.conversation_service, answer_queue=application_resources.answer_queue
+    ).build_response(http_request=http_request, tenant_identity=tenant_identity)
