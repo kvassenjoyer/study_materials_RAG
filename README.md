@@ -12,13 +12,72 @@
 
 **Стек:** Python / FastAPI, React / TypeScript, PostgreSQL, Qdrant. По умолчанию модели работают локально через Ollama: `embeddinggemma:300m` для поиска и `qwen3.5:4b` для ответов.
 
-## Быстрый запуск
+## Запуск через Docker
 
-Нужны **Python 3.12–3.13**, **uv**, **Node.js ≥ 22.12** с npm и **Ollama**. Для PostgreSQL можно использовать установленный сервер или Docker.
+Нужны **Docker Desktop** с Linux-контейнерами и **Ollama**. Docker собирает интерфейс и запускает приложение, PostgreSQL и Qdrant; устанавливать Python и Node.js на компьютер не нужно. Ollama работает на компьютере вне контейнеров.
 
-Все команды ниже выполняются из корня проекта в **PowerShell**.
+Все команды в обоих вариантах выполняются из корня проекта в **PowerShell**.
+
+### 1. Настройте окружение
+
+Скопируйте `.env.example` в `.env` и задайте `STUDY_RAG_JWT_SECRET` - случайную строку минимум из 32 латинских букв и цифр. Если `.env` уже настроен, используйте его.
+
+Готовая команда для создания `.env` со случайным секретом есть в [руководстве по установке](docs/runbook.md#настройка-окружения).
+
+### 2. Подготовьте Ollama
+
+Если приложение Ollama уже запущено, завершите его через значок в области уведомлений. В отдельном терминале запустите сервер, доступный контейнерам:
+
+```powershell
+$env:OLLAMA_HOST = "0.0.0.0:11434"
+ollama serve
+```
+
+Оставьте этот терминал открытым. Такой адрес разрешает подключения и через сетевые интерфейсы компьютера; ограничьте доступ к порту 11434 доверенными подключениями в брандмауэре. Подробнее - в [документации Ollama](https://github.com/ollama/ollama/blob/main/docs/faq.mdx#how-can-i-expose-ollama-on-my-network).
+
+В другом терминале скачайте модели:
+
+```powershell
+ollama pull embeddinggemma:300m
+ollama pull qwen3.5:4b
+```
+
+### 3. Соберите и запустите проект
+
+Запустите Docker Desktop, затем выполните:
+
+```powershell
+docker compose up -d database qdrant
+docker compose --profile application build application
+docker compose --profile application run --rm application uv run --no-sync alembic upgrade head
+docker compose --profile application up -d application
+```
+
+Compose сам задаёт приложению адреса PostgreSQL, Qdrant и Ollama. При первом запуске приложение скачивает токенизатор с Hugging Face, поэтому контейнеру нужен доступ к интернету. После запуска откройте [интерфейс](http://127.0.0.1:8000/) или [Swagger API](http://127.0.0.1:8000/docs).
+
+При следующих запусках запустите Ollama с настройкой из шага 2 и выполните:
+
+```powershell
+docker compose --profile application up -d
+```
+
+Остановить контейнеры с сохранением данных:
+
+```powershell
+docker compose --profile application down
+```
+
+Данные хранятся в Docker volumes. Данные прежнего локального запуска автоматически туда не переносятся. Перед переходом остановите локальный backend; порты 8000, 5432 и 6333 должны быть свободны для контейнеров.
+
+Этот сценарий настроен в проекте, но запуск контейнеров пока не проверен. Подробности обновления и диагностики - в [руководстве](docs/runbook.md#приложение-в-контейнере).
+
+## Запуск без Docker
+
+Нужны **Python 3.12–3.13**, **uv**, **Node.js ≥ 22.12** с npm, **PostgreSQL** и **Ollama**.
 
 ### 1. Установите зависимости и модели
+
+Запустите приложение Ollama или `ollama serve` в отдельном терминале. Сервис ожидается на `http://127.0.0.1:11434`.
 
 ```powershell
 uv sync --locked --group dev
@@ -28,23 +87,11 @@ ollama pull embeddinggemma:300m
 ollama pull qwen3.5:4b
 ```
 
-Запустите Ollama: приложение или `ollama serve` в отдельном терминале. Сервис ожидается на `http://127.0.0.1:11434`.
+### 2. Настройте окружение и базу данных
 
-### 2. Настройте окружение
+Подготовьте `.env` с секретом, как описано выше. Запустите установленный PostgreSQL, создайте роль и БД и укажите их адрес в `STUDY_RAG_DATABASE_URL`. Пример настройки есть в [руководстве для Windows](docs/runbook.md#native-windows).
 
-Скопируйте `.env.example` в `.env` и задайте `STUDY_RAG_JWT_SECRET` - случайную строку минимум из 32 латинских букв и цифр. Если `.env` уже настроен, используйте его.
-
-Готовая команда для создания `.env` со случайным секретом есть в [руководстве по установке](docs/runbook.md#настройка-окружения).
-
-Если PostgreSQL ещё не настроен, запустите его через Docker:
-
-```powershell
-docker compose up -d database
-```
-
-Docker создаст БД `study_rag` с логином и паролем `study_rag`, доступную на вашем компьютере по адресу `127.0.0.1:5432`. Эти настройки уже указаны в `.env.example`; после копирования в `.env` менять `STUDY_RAG_DATABASE_URL` для этого варианта запуска не нужно.
-
-Для своего PostgreSQL укажите адрес БД в `STUDY_RAG_DATABASE_URL` в `.env`. Qdrant по умолчанию хранит индекс в `.data/qdrant` и не требует отдельного сервера; оставьте `STUDY_RAG_QDRANT_URL` незаданной.
+Qdrant по умолчанию хранит индекс в `.data/qdrant` и не требует отдельного сервера; оставьте `STUDY_RAG_QDRANT_URL` незаданной.
 
 ### 3. Запустите приложение
 
@@ -57,7 +104,7 @@ uv run --no-sync uvicorn study_rag.main:create_application --factory --host 127.
 
 Откройте [интерфейс](http://127.0.0.1:8000/) или [Swagger API](http://127.0.0.1:8000/docs).
 
-### 4. Задайте первый вопрос
+## Первый вопрос
 
 1. Создайте аккаунт и выберите проект.
 2. Загрузите [пример о градиентном спуске](examples/materials/gradient-descent-ru.md) и дождитесь статуса «Готов».
@@ -69,18 +116,6 @@ uv run --no-sync uvicorn study_rag.main:create_application --factory --host 127.
 - Поддерживаются текстовые PDF. OCR, сканы и рукописные материалы не поддерживаются. Лимит файла по умолчанию - 100 МиБ.
 - Цитаты позволяют проверить источник, но не гарантируют правильность ответа. Обзор может охватывать лишь часть материалов.
 - Основной сценарий - локальный запуск. Для встроенного Qdrant нужен один процесс приложения (`--workers 1`).
-
-## Разработка
-
-```powershell
-npm --prefix frontend run dev
-npm --prefix frontend test
-uv run --no-sync pytest -q --strict-markers -m "not local_models"
-```
-
-Vite работает на порту 5173 и обращается к backend на 8000. После изменения интерфейса повторите `npm --prefix frontend run build`, чтобы обновить версию, которую отдаёт FastAPI. После изменения Python или `.env` перезапустите backend.
-
-Для PostgreSQL-тестов задайте `TEST_DATABASE_URL` отдельной тестовой БД; без неё эти проверки пропускаются. Полный набор проверок описан в [CI](docs/ci.md).
 
 ## Документация
 
