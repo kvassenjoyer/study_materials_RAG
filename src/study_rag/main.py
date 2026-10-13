@@ -29,9 +29,9 @@ def create_application(
             application.state.resources = None
 
     application: typing.Final = fastapi.FastAPI(
-        title="Мини-RAG по учебным материалам",
+        title="RAGumentation",
         description=(
-            "Локальный поиск по собственным TXT, Markdown и PDF. "
+            "RAGent - помощник для локального поиска и ответов по собственным TXT, Markdown и PDF. "
             "Каждый пользователь видит только свои материалы и чаты."
         ),
         version="0.1.0",

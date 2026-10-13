@@ -4,8 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f8f7f2" />
-    <meta name="description" content="Учебные материалы, понятные ответы и проверяемые источники." />
-    <title>Mini-RAG · Учебная библиотека</title>
+    <script>
+      (() => {
+        let preference = 'system';
+        try { preference = localStorage.getItem('ragumentation.theme') || 'system'; } catch {}
+        const dark = preference === 'dark' || (preference !== 'light' && preference !== 'dark' && matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        document.querySelector('meta[name="theme-color"]').content = dark ? '#181a21' : '#f8f7f2';
+      })();
+    </script>
+    <meta name="description" content="Учебные материалы, понятные ответы и проверяемые источники" />
+    <title>RAGumentation · Учебная библиотека</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   </head>
   <body>

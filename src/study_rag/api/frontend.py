@@ -12,7 +12,7 @@ import fastapi.staticfiles
 frontend_directory: typing.Final = pathlib.Path(__file__).resolve().parent.parent / "web"
 missing_frontend_page: typing.Final = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Учебные материалы — сборка интерфейса</title>
+<title>Учебные материалы - сборка интерфейса</title>
 <style>body{font:17px/1.6 system-ui,sans-serif;background:#f7f6f2;color:#25304b;margin:0;padding:8vw}
 main{max-width:680px;margin:auto}pre{padding:20px;background:#e9e8f1;border-radius:12px;overflow:auto}
 a{color:#5145bc}h1{line-height:1.2}</style></head>

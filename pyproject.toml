@@ -3,9 +3,9 @@ requires = ["hatchling>=1.32.4,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "study-materials-rag"
+name = "ragumentation"
 version = "0.1.0"
-description = "Local, multi-user RAG API for Russian and English study materials"
+description = "RAGumentation: local study materials search with the RAGent assistant"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "fastapi>=0.142.2,<0.143",

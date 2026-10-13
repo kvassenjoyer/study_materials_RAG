@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { ApiClient, errorText, isAbort } from '../api';
 import { Icon } from './Icon';
+import { Brand } from './Brand';
 import { ThemeToggle } from './ThemeToggle';
 
 export function AuthForm({ onToken, notice }: { onToken: (token: string) => void; notice: string }) {
@@ -24,7 +25,7 @@ export function AuthForm({ onToken, notice }: { onToken: (token: string) => void
     finally { if (!controller.signal.aborted) setBusy(false); }
   }
 
-  return <main className="auth-layout"><section className="auth-story"><div className="auth-brand-row"><span className="brand"><Icon name="book"/>Мини-RAG</span><ThemeToggle/></div>
+  return <main className="auth-layout"><section className="auth-story"><div className="auth-brand-row"><Brand/><ThemeToggle/></div>
     <div className="auth-intro"><h1>Учитесь с опорой на свои материалы</h1>
       <p>Соберите материалы в одном месте. <br/>Задавайте вопросы и возвращайтесь <br/>к первоисточнику в один клик</p>
       <div className="illustration" aria-hidden="true"><div className="paper paper-back"/><div className="paper paper-front"><Icon name="book" size={42}/><div className="paper-line"/><div className="paper-line short"/><div className="paper-line"/><span className="paper-stamp"><Icon name="check" size={16}/> С источниками</span></div><span className="illustration-spark"><Icon name="spark" size={29}/></span></div>

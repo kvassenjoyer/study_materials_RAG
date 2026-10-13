@@ -12,6 +12,8 @@ import { ManagementDialog } from './components/ManagementDialog';
 import { IndexingProgress } from './components/IndexingProgress';
 import { AnswerDuration } from './components/AnswerDuration';
 import { AnswerStatus, answerStatusText } from './components/AnswerStatus';
+import { Brand } from './components/Brand';
+import { ASSISTANT_NAME } from './branding';
 import { ThemeToggle } from './components/ThemeToggle';
 
 const date = (value: string) => new Intl.DateTimeFormat('ru', { day: 'numeric', month: 'short' }).format(new Date(value));
@@ -44,7 +46,7 @@ export function Workspace({ api, token, identity, onLogout }: { api: ApiClient; 
       setProjectId(current => current === id ? remaining[0]?.project_identifier ?? null : current);
     },
   };
-  if (!project) return <main className="project-loading"><div className="project-loading-heading"><span className="brand"><Icon name="book"/>Мини-RAG</span><ThemeToggle/></div>
+  if (!project) return <main className="project-loading"><div className="project-loading-heading"><Brand/><ThemeToggle/></div>
     {error ? <><p className="alert" role="alert">{error}</p><button className="primary-button" onClick={() => setReload(value => value + 1)}>Повторить</button></>
       : loaded ? <><h1>Начнём с проекта</h1><p>Создайте пространство для новой темы. В нём будут ваши чаты и материалы</p>
         <ProjectSwitcher api={api} projects={projects} onSelect={setProjectId} onCreated={projectActions.onProjectCreated}
@@ -321,7 +323,7 @@ function ProjectWorkspace({ api, identity, onLogout, project, projects, onSelect
   return <div className="workspace">
     {sidebarOpen && <button className="sidebar-backdrop" aria-label="Закрыть меню" onClick={() => setSidebarOpen(false)}/>}
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`} aria-label="Чаты и материалы"><div className="sidebar-top">
-      <span className="brand"><Icon name="book"/>Мини-RAG</span>
+      <Brand/>
       <button className="icon-button mobile-only" aria-label="Закрыть меню" onClick={() => setSidebarOpen(false)}><Icon name="close"/></button>
     </div><div className="sidebar-content">
       <section className="project-section" aria-label="Проекты">
@@ -371,12 +373,12 @@ function ProjectWorkspace({ api, identity, onLogout, project, projects, onSelect
         {!chatId && <p className="new-chat-hint">Задайте первый вопрос ниже - чат создастся автоматически</p>}
         {<div className="suggestion-list">{['Объясни основную идею материала', 'Какие понятия нужно запомнить?', 'Приведи пример из моего конспекта'].map(text => <button key={text} onClick={() => { setQuestion(text); textarea.current?.focus(); }}>{text}<Icon name="chevron" size={14}/></button>)}</div>}
       </section> : <div className="messages">{messages.map(message => <article className={`message ${message.role_name}`} key={message.message_identifier}>
-        <div className="message-heading"><span className={`message-avatar ${message.role_name}`}>{message.role_name === 'assistant' ? <Icon name="spark" size={17}/> : identity.login_name.slice(0, 1).toUpperCase()}</span><strong>{message.role_name === 'assistant' ? 'Помощник' : 'Вы'}</strong>{message.role_name === 'assistant' && <AnswerDuration milliseconds={message.response_duration_ms}/>}<span className="message-time">{new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit' }).format(new Date(message.created_at))}</span></div>
+        <div className="message-heading"><span className={`message-avatar ${message.role_name}`}>{message.role_name === 'assistant' ? <Icon name="spark" size={17}/> : identity.login_name.slice(0, 1).toUpperCase()}</span><strong>{message.role_name === 'assistant' ? ASSISTANT_NAME : 'Вы'}</strong>{message.role_name === 'assistant' && <AnswerDuration milliseconds={message.response_duration_ms}/>}<span className="message-time">{new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit' }).format(new Date(message.created_at))}</span></div>
         <div className="message-body"><Markdown text={message.content_text}/>{message.role_name === 'user' && message.turn_status === 'failed' && <span className="turn-state failed">{turnFailureText(message.turn_error_code)}</span>}
           {message.role_name === 'assistant' && <Sources citations={message.citation_records} onOpen={setCitation}/>}</div>
       </article>)}
       {optimisticQuestion && run && <article className="message user"><div className="message-heading"><span className="message-avatar user">{identity.login_name.slice(0, 1).toUpperCase()}</span><strong>Вы</strong></div><div className="message-body"><Markdown text={run.request.question}/></div></article>}
-      {(activeAnswer || (run && !persistedRun)) && <article className="message assistant pending-response"><div className="message-heading"><span className="message-avatar assistant"><Icon name="spark" size={17}/></span><strong>{'Помощник'}</strong></div><div className="message-body"><p className="loading-line" role="status"><span className="spinner"/>{activeAnswer ? answerStatusText(activeStatus) : 'Отправляю вопрос…'}</p>{activeStatus === 'queued' && <p className="queue-hint">Запрос начнётся, когда модель освободится. Можно перейти в другой чат или проект</p>}</div></article>}
+      {(activeAnswer || (run && !persistedRun)) && <article className="message assistant pending-response"><div className="message-heading"><span className="message-avatar assistant"><Icon name="spark" size={17}/></span><strong>{ASSISTANT_NAME}</strong></div><div className="message-body"><p className="loading-line" role="status"><span className="spinner"/>{activeAnswer ? answerStatusText(activeStatus) : 'Отправляю вопрос…'}</p>{activeStatus === 'queued' && <p className="queue-hint">Запрос начнётся, когда модель освободится. Можно перейти в другой чат или проект</p>}</div></article>}
       </div>}
       {historyError && <div className="history-error"><p className="alert" role="alert">{historyError}</p><button className="text-button" onClick={() => chatId && void loadHistory(chatId).catch(() => {})}>Обновить историю</button></div>}
       <div ref={end}/>
