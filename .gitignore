@@ -1,28 +1,56 @@
+# Python environments, caches and build output
 .venv/
-.agents/
-.local/
-.data/
-.cache/
+venv/
+env/
+ENV/
+.tox/
+.nox/
+.hypothesis/
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
 __pycache__/
 *.py[cod]
 *.egg-info/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
 dist/
 build/
+
+# Local configuration, data and models
+.agents/
+.local/
+.data/
+.cache/
 .env
 .env.*
 !.env.example
 models/
 artifacts/
-.DS_Store
-node_modules/
-src/study_rag/web/
+
+# Test reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
+
+# Frontend dependencies and generated assets
+node_modules/
+src/study_rag/web/
+*.tsbuildinfo
+
+# Logs and temporary files
+*.log
+*.log.*
+*.tmp
+*.swp
+*.swo
+*~
+
+# Local editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
