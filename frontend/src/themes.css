@@ -1,0 +1,91 @@
+:root { color-scheme: light; --theme-menu: #fffefa; --theme-menu-text: #595769; --theme-menu-hover: #f0edf8; --theme-menu-selected: #eae7f7; }
+.auth-brand-row, .project-loading-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.auth-brand-row { position: relative; z-index: 2; }
+.boot-theme { position: absolute; top: 24px; right: 24px; }
+.theme-switcher { position: relative; flex-shrink: 0; }
+.theme-toggle { width: 34px; height: 34px; }
+.theme-options { position: absolute; top: calc(100% + 9px); right: 0; z-index: 20; width: 187px; padding: 6px; border: 1px solid var(--line); border-radius: 12px; background: var(--theme-menu); box-shadow: 0 12px 35px #10101826; }
+.theme-options button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px; border-radius: 7px; background: transparent; color: var(--theme-menu-text); font-size: 13px; text-align: left; }
+.theme-options button > span { flex: 1; }
+.theme-options button:hover { background: var(--theme-menu-hover); }
+.theme-options button[aria-pressed=true] { background: var(--theme-menu-selected); color: var(--accent); }
+
+:root[data-theme=dark] {
+  color-scheme: dark;
+  color: #e5e7ef;
+  background: #181a21;
+  --accent: #b4adff;
+  --accent-dark: #7569d0;
+  --muted: #a6a9bd;
+  --line: #373b4c;
+  --paper: #20232d;
+  --background: #181a21;
+  --sidebar: #1d1f28;
+  --surface: #20232d;
+  --surface-raised: #272b37;
+  --surface-hover: #2c3040;
+  --text: #e5e7ef;
+  --text-secondary: #c4c6d5;
+  --text-subtle: #a6a9bd;
+  --accent-fill: #6158bc;
+  --accent-soft: #302d49;
+  --accent-border: #625783;
+  --warning: var(--text);
+  --success: #95c8ac;
+  --error: #f1acaf;
+  --error-surface: #3b2830;
+  --error-border: #734650;
+  --theme-menu: var(--surface-raised);
+  --theme-menu-text: var(--text-secondary);
+  --theme-menu-hover: var(--surface-hover);
+  --theme-menu-selected: var(--accent-soft);
+}
+:root[data-theme=dark] ::selection { background: #625783; color: #fff; }
+:root[data-theme=dark] :is(.main-panel, .auth-panel, .boot-screen) { background: var(--background); }
+:root[data-theme=dark] :is(.sidebar, .auth-story) { background: var(--sidebar); }
+:root[data-theme=dark] :is(.brand, .auth-intro h1, .auth-card h2, .welcome h1, .markdown h1, .markdown h2, .markdown h3, .markdown h4, .dialog-header h2, .project-dialog h2, .management-dialog h2, .project-loading h1) { color: var(--text); }
+:root[data-theme=dark] :is(.auth-intro > p, .breadcrumb strong, .chat-name, .document-name, .message-heading strong, .markdown, .source-filename, .project-trigger, .project-option-select, .welcome-steps strong) { color: var(--text-secondary); }
+:root[data-theme=dark] :is(.icon-button, .auth-tabs button, .field-help, .auth-note, .section-heading h2, .section-heading > span, .chat-date, .sidebar-empty, .document-details, .indexing-details, .account-login, .breadcrumb, .api-link, .welcome .eyebrow, .welcome-description, .welcome-steps span, .welcome-steps p, .history-loading, .message-time, .answer-duration, .image-placeholder, .section-label, .source-heading, .source-pages, .source-excerpt, .composer-foot, .project-hint, .project-overline, .project-dialog-description, .project-option-name small, .project-dialog-footer > span, .management-description, .management-label, .new-chat-hint, .project-loading > p, .queue-hint) { color: var(--text-subtle); }
+:root[data-theme=dark] :is(input, textarea, .project-picker select, .project-search input, .management-label input) { color: var(--text); }
+:root[data-theme=dark] input::placeholder, :root[data-theme=dark] textarea::placeholder { color: var(--text-subtle); }
+:root[data-theme=dark] :is(input, .project-picker select, .management-label input, .composer, .source-card, .source-dialog, .project-dialog, .management-dialog, .new-chat-button) { background: var(--surface); border-color: var(--line); }
+:root[data-theme=dark] input:focus { border-color: var(--accent-border); }
+:root[data-theme=dark] .project-search input { background: transparent; }
+:root[data-theme=dark] input:autofill { box-shadow: 0 0 0 1000px var(--surface-raised) inset; -webkit-text-fill-color: var(--text); }
+:root[data-theme=dark] :is(.source-dialog, .project-dialog, .management-dialog) { color: var(--text-secondary); box-shadow: 0 25px 100px #0006; }
+:root[data-theme=dark] .source-dialog::backdrop, :root[data-theme=dark] .project-dialog::backdrop, :root[data-theme=dark] .management-dialog::backdrop, :root[data-theme=dark] .sidebar-backdrop { background: #080a12a6; }
+:root[data-theme=dark] :is(.sidebar-content, .conversation, .chat-list, .project-options, .dialog-body) { scrollbar-color: #484b60 transparent; }
+:root[data-theme=dark] :is(.library-section .section-heading, .document-item, .sidebar-bottom, .topbar, .welcome-steps, .message, .markdown th, .markdown td, .markdown hr, .project-dialog-footer) { border-color: var(--line); }
+:root[data-theme=dark] :is(.new-chat-button, .upload-zone strong, .source-action, .project-search, .project-option .icon-button, .chat-row .chat-more, .secondary-button, .project-create, .run-error .text-button) { color: var(--accent); }
+:root[data-theme=dark] :is(.icon-button:hover:not(:disabled), .chat-item:hover, .new-chat-button:hover, .project-option:hover, .source-card:hover, .suggestion-list button:hover) { background: var(--surface-hover); color: var(--accent); border-color: var(--accent-border); }
+:root[data-theme=dark] :is(.auth-tabs, .upload-zone, .suggestion-list button, .project-search, .project-create, .markdown pre, .markdown code, .markdown th) { background: var(--surface-raised); border-color: var(--line); }
+:root[data-theme=dark] :is(.suggestion-list button, .upload-zone button, .upload-zone button span, .upload-zone p) { color: var(--text-secondary); }
+:root[data-theme=dark] :is(.chat-item.selected, .chat-item.selected:hover, .auth-tabs button[aria-pressed=true], .project-option.active, .project-create:hover, .upload-zone.dragging) { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
+:root[data-theme=dark] .chat-item.selected .chat-name { color: var(--accent); }
+:root[data-theme=dark] :is(.welcome-icon, .message-avatar.assistant, .project-mark, .project-option-mark, .project-dialog h2 span, .management-symbol, .section-label span, .source-label, .chat-actions button, .paper-stamp) { background: var(--accent-soft); color: var(--accent); }
+:root[data-theme=dark] :is(.brand-icon, .primary-button, .small-primary, .send-button) { background: var(--accent-fill); color: #fff; }
+:root[data-theme=dark] :is(.primary-button:hover:not(:disabled), .small-primary:hover:not(:disabled), .send-button:hover:not(:disabled)) { background: var(--accent-dark); }
+:root[data-theme=dark] :is(.file-icon, .avatar, .message-avatar.user) { background: #31323a; color: var(--text); }
+:root[data-theme=dark] .project-trigger { background: linear-gradient(125deg, var(--surface), var(--accent-soft)); border-color: var(--accent-border); box-shadow: 0 3px 12px #0001; }
+:root[data-theme=dark] .project-trigger:hover { border-color: var(--accent); }
+:root[data-theme=dark] .composer-area { background: linear-gradient(#181a2100, var(--background) 10%); }
+:root[data-theme=dark] .composer:focus-within { border-color: var(--accent-border); }
+:root[data-theme=dark] .markdown blockquote { background: var(--accent-soft); color: var(--text-secondary); border-color: var(--accent-border); }
+:root[data-theme=dark] :is(.document-state, .chat-answer-status.queued, .turn-state) { color: var(--warning); }
+:root[data-theme=dark] .document-state.ready { color: var(--success); }
+:root[data-theme=dark] .document-state.deleting { color: var(--text-subtle); }
+:root[data-theme=dark] :is(.sidebar-alert, .document-failure, .document-state.failed, .turn-state.failed, .danger-text, .delete-confirm > span, .run-error p) { color: var(--error); }
+:root[data-theme=dark] :is(.alert, .run-error, .management-symbol.danger, .chat-actions .danger-text) { background: var(--error-surface); color: var(--error); border-color: var(--error-border); }
+:root[data-theme=dark] .danger-hover:hover { background: var(--error-surface) !important; color: var(--error) !important; }
+:root[data-theme=dark] .danger-button { background: #99485a; color: #fff; }
+:root[data-theme=dark] .secondary-button { border-color: var(--line); }
+:root[data-theme=dark] :is(.stop-answer-button, .stop-answer-button:hover) { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
+:root[data-theme=dark] .stop-answer-button:hover { background: #3c365b; }
+:root[data-theme=dark] .indexing-progress progress { background: var(--surface-hover); }
+:root[data-theme=dark] .indexing-progress progress::-webkit-progress-bar { background: var(--surface-hover); }
+:root[data-theme=dark] .paper { border-color: var(--line); background: var(--surface); }
+:root[data-theme=dark] .paper-back { background: #36324b; }
+:root[data-theme=dark] .paper-front { color: var(--accent); }
+:root[data-theme=dark] .paper-line { background: #414451; }
+:root[data-theme=dark] .illustration-spark { color: var(--text); }
+:root[data-theme=dark] .source-view-tabs button[aria-pressed=true] { background: var(--accent-soft); }

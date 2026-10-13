@@ -4,6 +4,7 @@ import type { Identity } from './types';
 import { AuthForm } from './components/AuthForm';
 import { Icon } from './components/Icon';
 import { Workspace } from './Workspace';
+import { ThemeToggle } from './components/ThemeToggle';
 
 const storageKey = 'study-rag.session';
 function readToken(): string | null { try { return sessionStorage.getItem(storageKey); } catch { return null; } }
@@ -21,7 +22,7 @@ export function App() {
     try { if (next) sessionStorage.setItem(storageKey, next); else sessionStorage.removeItem(storageKey); } catch { /* Memory-only session still works. */ }
   }, []);
   const api = useMemo(() => new ApiClient(token, () => {
-    if (tokenRef.current === token) { changeToken(null); setNotice('Сессия истекла. Войдите ещё раз.'); }
+    if (tokenRef.current === token) { changeToken(null); setNotice('Сессия истекла. Войдите ещё раз'); }
   }), [token, changeToken]);
 
   useEffect(() => {
@@ -36,7 +37,7 @@ export function App() {
   }, [api, token, attempt]);
 
   if (!token) return <AuthForm onToken={changeToken} notice={notice}/>;
-  if (!identity) return <main className="boot-screen"><span className="brand-icon"><Icon name="book" size={26}/></span>
+  if (!identity) return <main className="boot-screen"><div className="boot-theme"><ThemeToggle/></div><span className="brand-icon"><Icon name="book" size={26}/></span>
     {connectionError ? <><p role="alert">{connectionError}</p><button className="primary-button" onClick={() => { setConnectionError(''); setAttempt(value => value + 1); }}>Повторить</button><button className="text-button" onClick={() => changeToken(null)}>Вернуться ко входу</button></>
       : <p className="loading-line" role="status"><span className="spinner"/>Открываю библиотеку…</p>}</main>;
   return <Workspace key={identity.user_identifier} api={api} token={token} identity={identity} onLogout={() => { setNotice(''); changeToken(null); }}/>;

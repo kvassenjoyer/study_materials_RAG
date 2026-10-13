@@ -12,6 +12,7 @@ import { ManagementDialog } from './components/ManagementDialog';
 import { IndexingProgress } from './components/IndexingProgress';
 import { AnswerDuration } from './components/AnswerDuration';
 import { AnswerStatus, answerStatusText } from './components/AnswerStatus';
+import { ThemeToggle } from './components/ThemeToggle';
 
 const date = (value: string) => new Intl.DateTimeFormat('ru', { day: 'numeric', month: 'short' }).format(new Date(value));
 const fileSize = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} МБ` : `${Math.max(1, Math.round(bytes / 1024))} КБ`;
@@ -43,7 +44,7 @@ export function Workspace({ api, token, identity, onLogout }: { api: ApiClient; 
       setProjectId(current => current === id ? remaining[0]?.project_identifier ?? null : current);
     },
   };
-  if (!project) return <main className="project-loading"><div className="project-loading-heading"><span className="brand"><Icon name="book"/>Мини-RAG</span></div>
+  if (!project) return <main className="project-loading"><div className="project-loading-heading"><span className="brand"><Icon name="book"/>Мини-RAG</span><ThemeToggle/></div>
     {error ? <><p className="alert" role="alert">{error}</p><button className="primary-button" onClick={() => setReload(value => value + 1)}>Повторить</button></>
       : loaded ? <><h1>Начнём с проекта</h1><p>Создайте пространство для новой темы. В нём будут ваши чаты и материалы</p>
         <ProjectSwitcher api={api} projects={projects} onSelect={setProjectId} onCreated={projectActions.onProjectCreated}
@@ -360,7 +361,7 @@ function ProjectWorkspace({ api, identity, onLogout, project, projects, onSelect
 
     <main className="main-panel"><header className="topbar"><button className="icon-button mobile-only" aria-label="Открыть меню" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><Icon name="menu"/></button>
       <div className="breadcrumb"><span>{project.title_text}</span><Icon name="chevron" size={13}/><strong>{activeChat?.title_text ?? 'Рабочее пространство'}</strong></div>
-      
+      <ThemeToggle/>
       <a className="api-link" href="/docs" target="_blank" rel="noopener noreferrer">API<Icon name="external" size={13}/></a>
     </header>
     <div className="conversation" ref={conversation}>
