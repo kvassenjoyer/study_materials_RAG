@@ -133,7 +133,7 @@ async def initialize_resources(*, settings: Settings | None = None) -> typing.As
             model_identifier=configured_settings.generation_model,
             context_tokens=configured_settings.generation_context_tokens,
             output_tokens=configured_settings.generation_output_tokens,
-            request_timeout_seconds=min(configured_settings.generation_timeout_seconds / 3, 40.0),
+            request_timeout_seconds=min(configured_settings.generation_timeout_seconds, 120.0),
         )
         resource_stack.push_async_callback(answer_generator.close_provider)
         await answer_generator.initialize_provider()
@@ -177,6 +177,9 @@ async def initialize_resources(*, settings: Settings | None = None) -> typing.As
             answer_generator=answer_generator,
             retrieval_limit=configured_settings.retrieval_limit,
             retrieval_candidates=configured_settings.retrieval_candidates,
+            overview_chunk_limit=configured_settings.overview_chunk_limit,
+            scan_chunk_limit=configured_settings.scan_chunk_limit,
+            maximum_search_passes=configured_settings.maximum_search_passes,
             minimum_similarity=configured_settings.minimum_similarity,
             history_message_limit=configured_settings.history_message_limit,
             turn_lease_seconds=configured_settings.turn_lease_seconds,

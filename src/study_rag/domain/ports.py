@@ -33,6 +33,16 @@ class ProjectRepository(typing.Protocol):
 
 
 class DocumentRepository(typing.Protocol):
+    async def list_ready_chunks(
+        self,
+        *,
+        tenant_identifier: uuid.UUID,
+        project_identifier: uuid.UUID,
+        embedding_profile: str,
+        limit_count: int,
+        offset_value: int,
+    ) -> tuple[entities.RetrievedChunk, ...]: ...
+
     async def register_document(
         self, *, tenant_identifier: uuid.UUID, document_registration: entities.DocumentRegistration
     ) -> entities.DocumentRecord: ...
@@ -263,6 +273,18 @@ class VectorStore(typing.Protocol):
 
 
 class AnswerGenerator(typing.Protocol):
+    async def plan_search(
+        self, *, question_text: str, conversation_history: tuple[entities.MessageRecord, ...]
+    ) -> entities.SearchPlan: ...
+
+    async def extract_evidence(
+        self,
+        *,
+        question_text: str,
+        context_chunks: tuple[entities.RetrievedChunk, ...],
+        covered_names: tuple[str, ...],
+    ) -> tuple[entities.EvidenceItem, ...]: ...
+
     async def rewrite_question(
         self, *, question_text: str, conversation_history: tuple[entities.MessageRecord, ...]
     ) -> str: ...

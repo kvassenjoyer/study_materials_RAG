@@ -245,6 +245,28 @@ class GeneratedAnswer:
 
 @typing.final
 @dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
+class SearchPlan:
+    question_text: str
+    scope_name: typing.Literal["focused", "comparison", "overview", "expansion"]
+    search_queries: tuple[str, ...]
+    search_keywords: tuple[str, ...]
+
+
+@typing.final
+@dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
+class EvidenceItem:
+    canonical_name: str
+    display_name: str
+    description_text: str
+    evidence_quote: str
+    chunk_identifier: uuid.UUID
+    source_name: str = ""
+    alias_names: tuple[str, ...] = ()
+    semantic_category: typing.Literal["structure", "family", "other"] = "other"
+
+
+@typing.final
+@dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
 class AnswerRecord:
     turn_identifier: uuid.UUID
     chat_identifier: uuid.UUID

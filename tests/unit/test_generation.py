@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import json
 import typing
@@ -12,6 +13,230 @@ from study_rag.domain import entities, errors
 
 MAXIMUM_HISTORY_MESSAGES: typing.Final = 8
 HISTORY_TOKEN_BUDGET: typing.Final = 100
+DEFAULT_OUTPUT_TOKENS: typing.Final = 2048
+RETRY_OUTPUT_TOKENS: typing.Final = 4096
+GENERATION_ATTEMPTS: typing.Final = 2
+
+
+async def test_search_plan_uses_user_intent_without_copying_old_assistant_claims() -> None:
+    model_requests: list[dict[str, typing.Any]] = []
+
+    def handle_request(model_request: httpx.Request) -> httpx.Response:
+        model_requests.append(json.loads(model_request.content))
+        return build_response(
+            response_value={
+                "question_text": "All data structures",
+                "scope_name": "overview",
+                "search_queries": ["data structures", "types of structures"],
+                "search_keywords": ["trees", "heaps"],
+            }
+        )
+
+    saved_history = (
+        build_message(content_text="What is a graph?"),
+        dataclasses.replace(build_message(content_text="ONLY GRAPHS EXIST"), role_name="assistant"),
+    )
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        search_plan = await OllamaAnswerGenerator(
+            http_client=http_client, text_tokenizer=CountingTokenizer()
+        ).plan_search(question_text="List all data structures", conversation_history=saved_history)
+    assert search_plan.scope_name == "overview"
+    request_payload = json.loads(model_requests[0]["messages"][1]["content"])
+    assert request_payload["chat_history"] == [{"role": "user", "content": "What is a graph?"}]
+
+
+@pytest.mark.parametrize(
+    ("evidence_quote", "canonical_name", "expected"),
+    [
+        ("Hash Tables", "Hash table", 1),
+        ("Invented quote", "Hash table", 0),
+        ("Hash Tables", "Fibonacci heap", 0),
+    ],
+)
+async def test_extraction_requires_real_quote_and_named_item(
+    evidence_quote: str, canonical_name: str, expected: int
+) -> None:
+    retrieved_chunk = build_source(content_text="Contents\n9 Hash Tables\n10 Balanced Binary Search Trees")
+
+    def handle_request(_request: httpx.Request) -> httpx.Response:
+        if review_response := mock_review_response(_request):
+            return review_response
+        return build_response(
+            response_value={
+                "evidence_items": [
+                    {
+                        "canonical_name": canonical_name,
+                        "item_name": "Hash Tables" if canonical_name == "Hash table" else canonical_name,
+                        "item_kind": "data_structure",
+                        "description_text": "Named in contents",
+                        "evidence_quote": evidence_quote,
+                        "source_label": "S1",
+                    }
+                ]
+            }
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        evidence_items = await OllamaAnswerGenerator(
+            http_client=http_client, text_tokenizer=CountingTokenizer()
+        ).extract_evidence(question_text="List structures", context_chunks=(retrieved_chunk,), covered_names=())
+    assert len(evidence_items) == expected
+
+
+async def test_extraction_rejects_unknown_source_identifier() -> None:
+    def handle_request(_request: httpx.Request) -> httpx.Response:
+        return build_response(
+            response_value={
+                "evidence_items": [
+                    {
+                        "canonical_name": "Hash table",
+                        "item_name": "Hash Tables",
+                        "item_kind": "data_structure",
+                        "description_text": "Named in contents",
+                        "evidence_quote": "Hash Tables",
+                        "source_label": "S9",
+                    }
+                ]
+            }
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        with pytest.raises(errors.DependencyUnavailableError) as raised_error:
+            await OllamaAnswerGenerator(http_client=http_client, text_tokenizer=CountingTokenizer()).extract_evidence(
+                question_text="List structures", context_chunks=(build_source(),), covered_names=()
+            )
+    assert raised_error.value.error_code == "unknown_answer_citation"
+
+
+@pytest.mark.parametrize(
+    ("source_name", "item_kind", "expected"),
+    [
+        ("Массивы", "data_structure", 1),
+        ("LEDA", "software", 0),
+        ("Suffix Tree Construction Algorithm", "data_structure", 0),
+    ],
+)
+async def test_catalog_accepts_russian_original_names_and_excludes_software(
+    source_name: str,
+    item_kind: str,
+    expected: int,
+) -> None:
+    def handle_request(_request: httpx.Request) -> httpx.Response:
+        if review_response := mock_review_response(_request):
+            return review_response
+        return build_response(
+            response_value={
+                "evidence_items": [
+                    {
+                        "canonical_name": "Array",
+                        "item_name": source_name,
+                        "item_kind": item_kind,
+                        "description_text": "",
+                        "evidence_quote": f"{source_name} представлены в разделе",
+                        "source_label": "S1",
+                    }
+                ]
+            }
+        )
+
+    retrieved_chunk = build_source(content_text=f"{source_name} представлены в разделе")
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        evidence_items = await OllamaAnswerGenerator(
+            http_client=http_client, text_tokenizer=CountingTokenizer()
+        ).extract_evidence(
+            question_text="Перечисли все структуры данных", context_chunks=(retrieved_chunk,), covered_names=()
+        )
+    assert len(evidence_items) == expected
+
+
+async def test_comparison_can_cite_more_than_six_supplied_sources() -> None:
+    retrieved_chunks = tuple(build_source(content_text=f"Evidence {item_index}") for item_index in range(12))
+
+    def handle_request(model_request: httpx.Request) -> httpx.Response:
+        request_payload = json.loads(model_request.content)
+        evidence = json.loads(request_payload["messages"][1]["content"])["document_evidence"]
+        assert len(evidence) == len(retrieved_chunks)
+        return build_response(
+            response_value={"answer_text": "Comparison [S12].", "sufficient_context": True, "source_labels": ["S12"]}
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        generated_answer = await OllamaAnswerGenerator(
+            http_client=http_client, text_tokenizer=CountingTokenizer()
+        ).generate_answer(question_text="Compare subjects", conversation_history=(), context_chunks=retrieved_chunks)
+    assert generated_answer.citation_identifiers == (retrieved_chunks[-1].chunk_record.chunk_identifier,)
+
+
+async def test_extraction_uses_a_separate_semantic_review_before_publishing_items() -> None:
+    model_requests: list[dict[str, typing.Any]] = []
+    retrieved_chunk = build_source(content_text="Hash Tables store key-value pairs. A circle is a geometric shape.")
+
+    def handle_request(model_request: httpx.Request) -> httpx.Response:
+        request_payload = json.loads(model_request.content)
+        model_requests.append(request_payload)
+        if "same_concept" in request_payload["format"]["properties"]:
+            return build_response(response_value={"same_concept": [True]})
+        if "verdicts" in request_payload["format"]["properties"]:
+            review_payload = json.loads(request_payload["messages"][1]["content"])
+            assert "item_kind" not in review_payload["candidates"][0]
+            return build_response(
+                response_value={
+                    "verdicts": [
+                        {
+                            "item_identifier": f"I{item_index}",
+                            "category_name": "geometry" if original_name == "circle" else "structure",
+                            "relevant": True,
+                            "canonical_name": original_name,
+                            "definition_quote": (
+                                "A circle is a geometric shape."
+                                if original_name == "circle"
+                                else "Hash Tables store key-value pairs."
+                            ),
+                            "equivalent_to": None,
+                        }
+                        for item_index, original_name in enumerate(("Hash Tables", "circle"), 1)
+                    ]
+                }
+            )
+        return build_response(
+            response_value={
+                "evidence_items": [
+                    {
+                        "canonical_name": original_name,
+                        "item_name": original_name,
+                        "item_kind": "data_structure",
+                        "description_text": "Unverified generated description",
+                        "evidence_quote": original_name,
+                        "source_label": "S1",
+                    }
+                    for original_name in ("Hash Tables", "circle")
+                ]
+            }
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        reviewed_items = await OllamaAnswerGenerator(
+            http_client=http_client, text_tokenizer=CountingTokenizer()
+        ).extract_evidence(
+            question_text="List data structures", context_chunks=(retrieved_chunk,), covered_names=("Хеш-таблицы",)
+        )
+    assert len(model_requests) == GENERATION_ATTEMPTS + 1
+    assert tuple(evidence_item.source_name for evidence_item in reviewed_items) == ("Hash Tables",)
+    assert reviewed_items[0].description_text == ""
+    assert reviewed_items[0].canonical_name == "Хеш-таблицы"
+    assert reviewed_items[0].chunk_identifier == retrieved_chunk.chunk_record.chunk_identifier
 
 
 @typing.final
@@ -65,15 +290,37 @@ def build_message(*, content_text: str, turn_status: entities.TurnStatus = "comp
     )
 
 
-def build_response(*, response_value: dict[str, object], finish_reason: str = "stop") -> httpx.Response:
+def build_response(*, response_value: dict[str, object] | str, finish_reason: str = "stop") -> httpx.Response:
     return httpx.Response(
         200,
         json={
             "model": "qwen3.5:4b",
             "done": True,
             "done_reason": finish_reason,
-            "message": {"content": json.dumps(response_value)},
+            "message": {"content": response_value if isinstance(response_value, str) else json.dumps(response_value)},
         },
+    )
+
+
+def mock_review_response(model_request: httpx.Request) -> httpx.Response | None:
+    request_payload = json.loads(model_request.content)
+    if "verdicts" not in request_payload["format"]["properties"]:
+        return None
+    review_payload = json.loads(request_payload["messages"][1]["content"])
+    return build_response(
+        response_value={
+            "verdicts": [
+                {
+                    "item_identifier": candidate["item_identifier"],
+                    "category_name": "structure",
+                    "relevant": True,
+                    "canonical_name": candidate["original_name"],
+                    "definition_quote": candidate["context"],
+                    "equivalent_to": None,
+                }
+                for candidate in review_payload["candidates"]
+            ]
+        }
     )
 
 
@@ -108,12 +355,14 @@ async def test_grounded_answer_disables_thinking_and_returns_verified_citation()
     assert isinstance(captured_payloads[0]["format"], dict)
 
 
-async def test_no_context_refuses_without_calling_model() -> None:
+async def test_no_context_answers_from_model_knowledge_without_citations() -> None:
     captured_calls: typing.Final[list[str]] = []
+    captured_prompts: typing.Final[list[str]] = []
 
     def handle_request(request_value: httpx.Request) -> httpx.Response:
         captured_calls.append(request_value.url.path)
-        return httpx.Response(500)
+        captured_prompts.append(json.loads(request_value.content)["messages"][0]["content"])
+        return build_response(response_value={"answer_text": "Hello! How can I help?"})
 
     async with httpx.AsyncClient(
         base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
@@ -124,7 +373,24 @@ async def test_no_context_refuses_without_calling_model() -> None:
         )
     assert not generated_answer.sufficient_context
     assert generated_answer.citation_identifiers == ()
-    assert captured_calls == []
+    assert generated_answer.answer_text == "Hello! How can I help?"
+    assert captured_calls == ["/api/chat"]
+    assert "You are RAGent" in captured_prompts[0]
+    assert "inside RAGumentation" in captured_prompts[0]
+    assert "Ignore outdated names or capability claims in older chat history" in captured_prompts[0]
+
+
+async def test_general_answer_cannot_invent_document_citations() -> None:
+    def handle_request(_request_value: httpx.Request) -> httpx.Response:
+        return build_response(response_value={"answer_text": "Fabricated [S1]"})
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test",
+        transport=httpx.MockTransport(handle_request),
+    ) as http_client:
+        answer_generator = OllamaAnswerGenerator(http_client=http_client, text_tokenizer=CountingTokenizer())
+        with pytest.raises(errors.DependencyUnavailableError, match="invent document citations"):
+            await answer_generator.generate_answer(question_text="Hello", conversation_history=(), context_chunks=())
 
 
 @pytest.mark.parametrize(
@@ -194,7 +460,10 @@ async def test_answer_rejects_unknown_inline_or_declared_citations_and_no_eviden
 
 
 async def test_length_finish_cannot_publish_partial_answer() -> None:
-    def handle_request(request_value: httpx.Request) -> httpx.Response:  # noqa: ARG001 -- transport boundary receives request.
+    captured_calls: list[str] = []
+
+    def handle_request(request_value: httpx.Request) -> httpx.Response:
+        captured_calls.append(request_value.url.path)
         return build_response(
             response_value={"answer_text": "Partial [S1].", "sufficient_context": True, "source_labels": ["S1"]},
             finish_reason="length",
@@ -208,7 +477,105 @@ async def test_length_finish_cannot_publish_partial_answer() -> None:
             await answer_generator.generate_answer(
                 question_text="Where?", conversation_history=(), context_chunks=(build_source(),)
             )
+    assert raised_error.value.error_code == "model_response_truncated"
+    assert len(captured_calls) == GENERATION_ATTEMPTS
+
+
+@pytest.mark.parametrize("grounded_answer", [True, False])
+async def test_truncated_json_is_regenerated_and_only_complete_answer_is_returned(grounded_answer: bool) -> None:
+    captured_payloads: list[dict[str, typing.Any]] = []
+    retrieved_source = build_source()
+
+    def handle_request(request_value: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request_value.content))
+        if len(captured_payloads) == 1:
+            return build_response(response_value='{"answer_text":"TRUNCATED', finish_reason="length")
+        response_value: dict[str, object] = {
+            "answer_text": "Complete answer [S1]." if grounded_answer else "Complete answer."
+        }
+        if grounded_answer:
+            response_value.update(sufficient_context=True, source_labels=["S1"])
+        return build_response(response_value=response_value)
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        generated_answer = await OllamaAnswerGenerator(
+            http_client=http_client, text_tokenizer=CountingTokenizer()
+        ).generate_answer(
+            question_text="Explain this",
+            conversation_history=(),
+            context_chunks=(retrieved_source,) if grounded_answer else (),
+        )
+
+    assert [one_payload["options"]["num_predict"] for one_payload in captured_payloads] == [
+        DEFAULT_OUTPUT_TOKENS,
+        RETRY_OUTPUT_TOKENS,
+    ]
+    assert captured_payloads[0]["messages"] == captured_payloads[1]["messages"]
+    assert captured_payloads[0]["format"] == captured_payloads[1]["format"]
+    assert "TRUNCATED" not in generated_answer.answer_text
+    assert generated_answer.citation_identifiers == (
+        (retrieved_source.chunk_record.chunk_identifier,) if grounded_answer else ()
+    )
+
+
+async def test_length_retry_respects_remaining_context_and_still_validates_sources() -> None:
+    captured_payloads: list[dict[str, typing.Any]] = []
+    context_tokens = 5700
+    reserve_tokens = 1024
+
+    def handle_request(request_value: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request_value.content))
+        if len(captured_payloads) == 1:
+            return build_response(response_value='{"answer_text":"Partial', finish_reason="length")
+        return build_response(
+            response_value={
+                "answer_text": "Fabricated source [S9].",
+                "sufficient_context": True,
+                "source_labels": ["S9"],
+            }
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        answer_generator = OllamaAnswerGenerator(
+            http_client=http_client, text_tokenizer=CountingTokenizer(), context_tokens=context_tokens
+        )
+        with pytest.raises(errors.DependencyUnavailableError) as raised_error:
+            await answer_generator.generate_answer(
+                question_text="Explain this", conversation_history=(), context_chunks=(build_source(),)
+            )
+
+    assert raised_error.value.error_code == "unknown_answer_citation"
+    assert len(captured_payloads) == GENERATION_ATTEMPTS
+    retry_payload = captured_payloads[-1]
+    prompt_tokens = sum(len(one_message["content"]) for one_message in retry_payload["messages"])
+    assert DEFAULT_OUTPUT_TOKENS <= retry_payload["options"]["num_predict"] < RETRY_OUTPUT_TOKENS
+    assert prompt_tokens + reserve_tokens + retry_payload["options"]["num_predict"] <= context_tokens
+
+
+@pytest.mark.parametrize("finish_reason", ["load", "unknown", "stop", "length"])
+async def test_unfinished_envelope_is_not_retried_or_published(finish_reason: str) -> None:
+    captured_calls: list[str] = []
+
+    def handle_request(request_value: httpx.Request) -> httpx.Response:
+        captured_calls.append(request_value.url.path)
+        return httpx.Response(
+            200, json={"model": "qwen3.5:4b", "done": False, "done_reason": finish_reason, "message": {"content": "{}"}}
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://ollama.test", transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        with pytest.raises(errors.DependencyUnavailableError) as raised_error:
+            await OllamaAnswerGenerator(http_client=http_client, text_tokenizer=CountingTokenizer()).generate_answer(
+                question_text="Hello", conversation_history=(), context_chunks=()
+            )
+
     assert raised_error.value.error_code == "incomplete_model_response"
+    assert captured_calls == ["/api/chat"]
 
 
 async def test_rewrite_bounds_history_and_excludes_uncompleted_messages() -> None:
@@ -271,7 +638,7 @@ async def test_generation_drops_complete_sources_to_fit_budget() -> None:
         answer_generator = OllamaAnswerGenerator(
             http_client=http_client,
             text_tokenizer=CountingTokenizer(),
-            context_tokens=2300,
+            context_tokens=3700,
             output_tokens=100,
             prompt_reserve_tokens=100,
         )

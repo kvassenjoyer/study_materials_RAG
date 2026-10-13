@@ -20,6 +20,55 @@ class PostgreSQLDocumentRepository:
     def __init__(self, *, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_scope = database.PostgreSQLSessionScope(session_factory=session_factory)
 
+    async def list_ready_chunks(
+        self,
+        *,
+        tenant_identifier: uuid.UUID,
+        project_identifier: uuid.UUID,
+        embedding_profile: str,
+        limit_count: int,
+        offset_value: int,
+    ) -> tuple[entities.RetrievedChunk, ...]:
+        if not 1 <= limit_count <= maximum_chunk_page_size or offset_value < 0:
+            raise errors.InvalidInputError(error_code="invalid_chunk_page", message_text="Invalid chunk page")
+        async with self._session_scope.reading_session() as database_session:
+            chunk_rows = await database_session.execute(
+                select(database.ChunkRow, database.DocumentRow.filename_text)
+                .join(
+                    database.DocumentRow,
+                    and_(
+                        database.ChunkRow.document_identifier == database.DocumentRow.document_identifier,
+                        database.ChunkRow.tenant_identifier == database.DocumentRow.tenant_identifier,
+                    ),
+                )
+                .join(
+                    database.ProjectRow,
+                    and_(
+                        database.ProjectRow.project_identifier == database.DocumentRow.project_identifier,
+                        database.ProjectRow.tenant_identifier == database.DocumentRow.tenant_identifier,
+                    ),
+                )
+                .where(
+                    database.ChunkRow.tenant_identifier == tenant_identifier,
+                    database.DocumentRow.tenant_identifier == tenant_identifier,
+                    database.DocumentRow.project_identifier == project_identifier,
+                    database.DocumentRow.embedding_profile == embedding_profile,
+                    database.DocumentRow.state_name == "ready",
+                    database.ProjectRow.deleted_at.is_(None),
+                )
+                .order_by(database.ChunkRow.document_identifier, database.ChunkRow.ordinal_value)
+                .offset(offset_value)
+                .limit(limit_count)
+            )
+            return tuple(
+                entities.RetrievedChunk(
+                    chunk_record=mapping.chunk_record(chunk_row),
+                    filename_text=filename_text,
+                    similarity_score=0.0,
+                )
+                for chunk_row, filename_text in chunk_rows
+            )
+
     async def register_document(
         self,
         *,

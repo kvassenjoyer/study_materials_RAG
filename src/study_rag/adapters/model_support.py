@@ -12,7 +12,7 @@ import httpx
 from study_rag.domain import entities, errors
 
 
-MAXIMUM_REQUEST_SECONDS: typing.Final = 40
+MAXIMUM_REQUEST_SECONDS: typing.Final = 120
 MAXIMUM_RETRY_ATTEMPTS: typing.Final = 3
 
 
@@ -61,19 +61,30 @@ class EmbeddingVectorValidator:
 @typing.final
 class OllamaHttpTransport:
     def __init__(
-        self, *, http_client: httpx.AsyncClient, timeout_seconds: float = 40.0, retry_attempts: int = 3
+        self,
+        *,
+        http_client: httpx.AsyncClient,
+        timeout_seconds: float = 40.0,
+        retry_attempts: int = 3,
+        operation_timeout_seconds: float | None = None,
     ) -> None:
         if not 0 < timeout_seconds <= MAXIMUM_REQUEST_SECONDS or not 1 <= retry_attempts <= MAXIMUM_RETRY_ATTEMPTS:
             raise ValueError("Model requests require bounded timeouts and at most three attempts")
+        operation_budget = (
+            timeout_seconds * retry_attempts if operation_timeout_seconds is None else operation_timeout_seconds
+        )
+        if not 0 < operation_budget <= timeout_seconds * retry_attempts:
+            raise ValueError("The operation timeout must fit within the bounded request attempts")
         self._http_client: typing.Final = http_client
         self._timeout_seconds: typing.Final = timeout_seconds
         self._retry_attempts: typing.Final = retry_attempts
+        self._operation_timeout_seconds: typing.Final = operation_budget
         self._request_lock: typing.Final = asyncio.Lock()
 
     async def post_payload(self, *, endpoint_path: str, payload_value: dict[str, object]) -> object:
         try:
             # Waiting for another request consumes the same overall budget as retries.
-            async with asyncio.timeout(self._timeout_seconds * self._retry_attempts):
+            async with asyncio.timeout(self._operation_timeout_seconds):
                 async with self._request_lock:
                     return await self._request_payload(endpoint_path=endpoint_path, payload_value=payload_value)
         except TimeoutError as request_error:
@@ -91,8 +102,12 @@ class OllamaHttpTransport:
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as request_error:
                 if attempt_number + 1 == self._retry_attempts:
                     raise errors.DependencyUnavailableError(
-                        error_code="model_unavailable",
-                        message_text="The local model server is temporarily unavailable.",
+                        error_code="model_request_timeout"
+                        if isinstance(request_error, httpx.TimeoutException)
+                        else "model_unavailable",
+                        message_text="The local model request timed out."
+                        if isinstance(request_error, httpx.TimeoutException)
+                        else "The local model server is temporarily unavailable.",
                     ) from request_error
             except httpx.HTTPStatusError as request_error:
                 if http_response.status_code not in {429, 500, 502, 503, 504}:

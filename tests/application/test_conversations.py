@@ -54,9 +54,9 @@ def scenario_context() -> ScenarioContext:
         assistant_message=None,
     )
     document_record: typing.Final = entities.DocumentRecord(
-        project_identifier=uuid.uuid4(),
         document_identifier=document_identifier,
         tenant_identifier=tenant_identifier,
+        project_identifier=uuid.uuid4(),
         filename_text="lecture.md",
         media_type="text/markdown",
         storage_key="fixture",
@@ -86,7 +86,6 @@ def scenario_context() -> ScenarioContext:
     )
     conversation_repository: typing.Final = unittest.mock.AsyncMock(spec=ports.ConversationRepository)
     conversation_repository.begin_turn.return_value = turn_record
-    conversation_repository.fetch_history.return_value = ()
     conversation_repository.fetch_chat.return_value = entities.ChatRecord(
         chat_identifier=chat_identifier,
         tenant_identifier=tenant_identifier,
@@ -95,6 +94,7 @@ def scenario_context() -> ScenarioContext:
         created_at=recorded_timestamp,
         updated_at=recorded_timestamp,
     )
+    conversation_repository.fetch_history.return_value = ()
 
     async def complete_saved_turn(
         *,
@@ -136,6 +136,13 @@ def scenario_context() -> ScenarioContext:
         for chunk_record in chunk_records
     )
     answer_generator: typing.Final = unittest.mock.AsyncMock(spec=ports.AnswerGenerator)
+    answer_generator.plan_search.return_value = entities.SearchPlan(
+        question_text="Explain gradient descent",
+        scope_name="focused",
+        search_queries=("Explain gradient descent",),
+        search_keywords=("gradient descent",),
+    )
+    document_repository.list_ready_chunks.return_value = ()
     answer_generator.generate_answer.return_value = entities.GeneratedAnswer(
         answer_text="Supported explanation [S3].",
         sufficient_context=True,
@@ -159,8 +166,13 @@ def scenario_context() -> ScenarioContext:
     )
 
 
-async def test_no_materials_persist_refusal_without_model(scenario_context: ScenarioContext) -> None:
+async def test_no_materials_persist_general_answer_with_notice(scenario_context: ScenarioContext) -> None:
     scenario_context.document_repository.fetch_ready_identifiers.return_value = ()
+    scenario_context.answer_generator.generate_answer.return_value = entities.GeneratedAnswer(
+        answer_text="A general explanation.",
+        sufficient_context=False,
+        citation_identifiers=(),
+    )
 
     answer_record: typing.Final = await scenario_context.conversation_service.answer_question(
         tenant_identity=scenario_context.tenant_identity,
@@ -171,7 +183,12 @@ async def test_no_materials_persist_refusal_without_model(scenario_context: Scen
 
     assert answer_record.assistant_message.sufficient_context is False
     assert not answer_record.assistant_message.citation_records
-    scenario_context.answer_generator.generate_answer.assert_not_awaited()
+    assert "without sources from project materials" in answer_record.assistant_message.content_text
+    scenario_context.answer_generator.generate_answer.assert_awaited_once_with(
+        question_text="Explain gradient descent",
+        conversation_history=(),
+        context_chunks=(),
+    )
     scenario_context.embedding_provider.embed_question.assert_not_awaited()
 
 
@@ -191,12 +208,88 @@ async def test_citation_subset_keeps_original_source_label(scenario_context: Sce
     )
 
 
+@pytest.mark.parametrize("question_text", ["Привет!", "Что ты умеешь?"])
+async def test_greeting_uses_model_without_searching_materials(
+    scenario_context: ScenarioContext, question_text: str
+) -> None:
+    scenario_context.answer_generator.generate_answer.return_value = entities.GeneratedAnswer(
+        answer_text="Привет! Чем помочь?",
+        sufficient_context=False,
+        citation_identifiers=(),
+    )
+    answer_record = await scenario_context.conversation_service.answer_question(
+        tenant_identity=scenario_context.tenant_identity,
+        chat_identifier=scenario_context.turn_record.chat_identifier,
+        client_request_identifier=scenario_context.turn_record.client_request_identifier,
+        question_text=question_text,
+    )
+    assert "без источников из материалов проекта" in answer_record.assistant_message.content_text
+    assert "Привет! Чем помочь?" in answer_record.assistant_message.content_text
+    scenario_context.document_repository.fetch_ready_identifiers.assert_not_awaited()
+    scenario_context.embedding_provider.embed_question.assert_not_awaited()
+
+
+async def test_insufficient_evidence_falls_back_to_general_answer(scenario_context: ScenarioContext) -> None:
+    scenario_context.answer_generator.generate_answer.side_effect = [
+        entities.GeneratedAnswer(
+            answer_text="Insufficient evidence", sufficient_context=False, citation_identifiers=()
+        ),
+        entities.GeneratedAnswer(
+            answer_text="A general explanation", sufficient_context=False, citation_identifiers=()
+        ),
+    ]
+    answer_record = await scenario_context.conversation_service.answer_question(
+        tenant_identity=scenario_context.tenant_identity,
+        chat_identifier=scenario_context.turn_record.chat_identifier,
+        client_request_identifier=scenario_context.turn_record.client_request_identifier,
+        question_text="Explain something else",
+    )
+    assert "A general explanation" in answer_record.assistant_message.content_text
+    assert not answer_record.assistant_message.citation_records
+    assert scenario_context.answer_generator.generate_answer.await_args_list[-1].kwargs["context_chunks"] == ()
+
+
+async def test_context_from_another_project_of_same_account_is_rejected(scenario_context: ScenarioContext) -> None:
+    original_document = scenario_context.document_repository.fetch_document.return_value
+    scenario_context.document_repository.fetch_document.return_value = dataclasses.replace(
+        original_document,
+        project_identifier=uuid.uuid4(),
+    )
+    scenario_context.answer_generator.generate_answer.return_value = entities.GeneratedAnswer(
+        answer_text="General only",
+        sufficient_context=False,
+        citation_identifiers=(),
+    )
+    answer_record = await scenario_context.conversation_service.answer_question(
+        tenant_identity=scenario_context.tenant_identity,
+        chat_identifier=scenario_context.turn_record.chat_identifier,
+        client_request_identifier=scenario_context.turn_record.client_request_identifier,
+        question_text="Explain gradient descent",
+    )
+    assert not answer_record.assistant_message.citation_records
+    expected_project = original_document.project_identifier
+    assert (
+        scenario_context.document_repository.fetch_ready_identifiers.await_args.kwargs["project_identifier"]
+        == expected_project
+    )
+    assert (
+        scenario_context.document_repository.fetch_ready_chunks.await_args.kwargs["project_identifier"]
+        == expected_project
+    )
+    assert scenario_context.answer_generator.generate_answer.await_args.kwargs["context_chunks"] == ()
+
+
 async def test_followup_rewrites_query_using_completed_history(scenario_context: ScenarioContext) -> None:
     saved_history: typing.Final = (
         dataclasses.replace(scenario_context.turn_record.user_message, turn_status="completed"),
     )
     scenario_context.conversation_repository.fetch_history.return_value = saved_history
-    scenario_context.answer_generator.rewrite_question.return_value = "Numerical example of gradient descent"
+    scenario_context.answer_generator.plan_search.return_value = entities.SearchPlan(
+        question_text="Numerical example of gradient descent",
+        scope_name="focused",
+        search_queries=("Numerical example of gradient descent",),
+        search_keywords=("gradient descent",),
+    )
 
     answer_record: typing.Final = await scenario_context.conversation_service.answer_question(
         tenant_identity=scenario_context.tenant_identity,
@@ -206,13 +299,54 @@ async def test_followup_rewrites_query_using_completed_history(scenario_context:
     )
 
     assert answer_record.assistant_message.sufficient_context is True
-    scenario_context.answer_generator.rewrite_question.assert_awaited_once_with(
+    scenario_context.answer_generator.plan_search.assert_awaited_once_with(
         question_text="Show an example",
         conversation_history=saved_history,
     )
     scenario_context.embedding_provider.embed_question.assert_awaited_once_with(
         question_text="Numerical example of gradient descent"
     )
+
+
+async def test_automatic_overview_persists_sources_and_bypasses_old_short_answer(
+    scenario_context: ScenarioContext,
+) -> None:
+    chunk_records = scenario_context.chunk_records
+    scenario_context.document_repository.list_ready_chunks.return_value = tuple(
+        entities.RetrievedChunk(
+            chunk_record=dataclasses.replace(chunk_record, content_text=f"Contents\nTopic {item_index}"),
+            filename_text="lecture.md",
+            similarity_score=0.0,
+        )
+        for item_index, chunk_record in enumerate(chunk_records)
+    )
+    scenario_context.answer_generator.plan_search.return_value = entities.SearchPlan(
+        question_text="Narrow old topic",
+        scope_name="focused",
+        search_queries=("structures",),
+        search_keywords=("topic",),
+    )
+    scenario_context.answer_generator.extract_evidence.return_value = (
+        entities.EvidenceItem(
+            canonical_name="Hash table",
+            display_name="Hash table",
+            source_name="Hash Table",
+            description_text="",
+            evidence_quote="Hash Table",
+            chunk_identifier=chunk_records[0].chunk_identifier,
+        ),
+    )
+    answer_record = await scenario_context.conversation_service.answer_question(
+        tenant_identity=scenario_context.tenant_identity,
+        chat_identifier=scenario_context.turn_record.chat_identifier,
+        client_request_identifier=scenario_context.turn_record.client_request_identifier,
+        question_text="Перечисли все структуры данных в материалах проекта",
+    )
+    assert "Hash Table" in answer_record.assistant_message.content_text
+    assert "При отборе просмотрено" in answer_record.assistant_message.content_text
+    assert answer_record.assistant_message.citation_records[0].chunk_identifier == chunk_records[0].chunk_identifier
+    scenario_context.answer_generator.generate_answer.assert_not_awaited()
+    scenario_context.embedding_provider.embed_question.assert_not_awaited()
 
 
 async def test_hallucinated_citation_fails_turn_without_assistant(scenario_context: ScenarioContext) -> None:

@@ -145,6 +145,42 @@ async def expire_document_lease(repository_harness: RepositoryHarness, document_
         )
 
 
+async def test_overview_scan_paginates_ready_chunks_and_excludes_deleted_or_foreign_data(
+    repository_harness: RepositoryHarness,
+) -> None:
+    document_record = await registered_fixture(repository_harness)
+    document_lease = await claim_fixture(repository_harness)
+    chunk_records = tuple(
+        dataclasses.replace(chunk_fixture(document_record), ordinal_value=ordinal_value) for ordinal_value in range(3)
+    )
+    await repository_harness.document_repository.replace_chunks(
+        document_lease=document_lease, chunk_records=chunk_records, page_count=3
+    )
+    arguments: ChunkScanArguments = {
+        "tenant_identifier": document_record.tenant_identifier,
+        "project_identifier": document_record.project_identifier,
+        "embedding_profile": document_record.embedding_profile,
+        "limit_count": 2,
+        "offset_value": 0,
+    }
+    assert not await repository_harness.document_repository.list_ready_chunks(**arguments)
+    await repository_harness.document_repository.complete_indexing(document_lease=document_lease)
+    first_sources = await repository_harness.document_repository.list_ready_chunks(**arguments)
+    second_sources = await repository_harness.document_repository.list_ready_chunks(**(arguments | {"offset_value": 2}))
+    assert tuple(retrieved_source.chunk_record for retrieved_source in first_sources + second_sources) == chunk_records
+    assert not await repository_harness.document_repository.list_ready_chunks(
+        **(arguments | {"tenant_identifier": uuid.uuid4()})
+    )
+    assert not await repository_harness.document_repository.list_ready_chunks(
+        **(arguments | {"project_identifier": uuid.uuid4()})
+    )
+    await repository_harness.document_repository.request_deletion(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    assert not await repository_harness.document_repository.list_ready_chunks(**arguments)
+
+
 async def test_initial_migration_creates_all_tables(repository_harness: RepositoryHarness) -> None:
     async with repository_harness.database_engine.connect() as connection:
         table_names = await connection.run_sync(lambda connection: inspect(connection).get_table_names())
@@ -490,6 +526,120 @@ async def test_login_accounts_reuse_legacy_column_and_preserve_existing_identifi
     with pytest.raises(errors.ResourceConflictError) as raised_error:
         await repository.create_account(login_name="student_123", password_hash="another-hash")
     assert raised_error.value.error_code == "login_already_registered"
+
+
+async def test_projects_isolate_chats_documents_deduplication_and_ready_chunks(
+    repository_harness: RepositoryHarness,
+) -> None:
+    user_account = await create_test_account(repository_harness)
+    project_repository = PostgreSQLProjectRepository(session_factory=repository_harness.session_factory)
+    first_project = await project_repository.create_project(
+        tenant_identifier=user_account.user_identifier, title_text="Algebra"
+    )
+    second_project = await project_repository.create_project(
+        tenant_identifier=user_account.user_identifier, title_text="Physics"
+    )
+    first_registration = dataclasses.replace(
+        document_registration(), project_identifier=first_project.project_identifier
+    )
+    second_registration = dataclasses.replace(
+        document_registration(), project_identifier=second_project.project_identifier
+    )
+    first_document = await repository_harness.document_repository.register_document(
+        tenant_identifier=user_account.user_identifier,
+        document_registration=first_registration,
+    )
+    second_document = await repository_harness.document_repository.register_document(
+        tenant_identifier=user_account.user_identifier,
+        document_registration=second_registration,
+    )
+    duplicate_document = await repository_harness.document_repository.register_document(
+        tenant_identifier=user_account.user_identifier,
+        document_registration=dataclasses.replace(first_registration, document_identifier=uuid.uuid4()),
+    )
+    assert duplicate_document.document_identifier == first_document.document_identifier
+    assert second_document.document_identifier != first_document.document_identifier
+    first_chunk = chunk_fixture(first_document)
+    second_chunk = chunk_fixture(second_document)
+    for document_record, chunk_record in ((first_document, first_chunk), (second_document, second_chunk)):
+        document_lease = await claim_fixture(repository_harness)
+        assert document_lease.document_record.document_identifier == document_record.document_identifier
+        await repository_harness.document_repository.replace_chunks(
+            document_lease=document_lease, chunk_records=(chunk_record,), page_count=1
+        )
+        await repository_harness.document_repository.complete_indexing(document_lease=document_lease)
+    document_page = await repository_harness.document_repository.list_documents(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=first_project.project_identifier,
+        limit_count=50,
+        offset_value=0,
+    )
+    assert document_page.items == (
+        await repository_harness.document_repository.fetch_document(
+            tenant_identifier=user_account.user_identifier,
+            document_identifier=first_document.document_identifier,
+        ),
+    )
+    assert await repository_harness.document_repository.fetch_ready_identifiers(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=first_project.project_identifier,
+        embedding_profile=first_document.embedding_profile,
+    ) == (first_document.document_identifier,)
+    assert await repository_harness.document_repository.fetch_ready_chunks(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=first_project.project_identifier,
+        embedding_profile=first_document.embedding_profile,
+        chunk_identifiers=(first_chunk.chunk_identifier, second_chunk.chunk_identifier),
+    ) == (first_chunk,)
+    overview_sources = await repository_harness.document_repository.list_ready_chunks(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=first_project.project_identifier,
+        embedding_profile=first_document.embedding_profile,
+        limit_count=256,
+        offset_value=0,
+    )
+    assert tuple(retrieved_source.chunk_record for retrieved_source in overview_sources) == (first_chunk,)
+    assert not await repository_harness.document_repository.list_ready_chunks(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=first_project.project_identifier,
+        embedding_profile="different-profile",
+        limit_count=256,
+        offset_value=0,
+    )
+    first_chat = await repository_harness.conversation_repository.create_chat(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=first_project.project_identifier,
+        title_text="First chat",
+    )
+    await repository_harness.conversation_repository.create_chat(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=second_project.project_identifier,
+        title_text="Second chat",
+    )
+    chat_page = await repository_harness.conversation_repository.list_chats(
+        tenant_identifier=user_account.user_identifier,
+        project_identifier=first_project.project_identifier,
+        limit_count=50,
+        offset_value=0,
+    )
+    assert chat_page.items == (first_chat,)
+    foreign_account = await create_test_account(repository_harness)
+    with pytest.raises(errors.ResourceNotFoundError):
+        await project_repository.fetch_project(
+            tenant_identifier=foreign_account.user_identifier,
+            project_identifier=first_project.project_identifier,
+        )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository_harness.conversation_repository.create_chat(
+            tenant_identifier=foreign_account.user_identifier,
+            project_identifier=first_project.project_identifier,
+            title_text="Forbidden",
+        )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository_harness.document_repository.register_document(
+            tenant_identifier=foreign_account.user_identifier,
+            document_registration=first_registration,
+        )
 
 
 async def test_default_project_creation_is_idempotent_under_concurrent_requests(

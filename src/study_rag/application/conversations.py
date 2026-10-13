@@ -3,9 +3,12 @@
 import asyncio
 import dataclasses
 import logging
+import re
+import time
 import typing
 import uuid
 
+from study_rag.application.adaptive_search import AdaptiveSearch
 from study_rag.domain import entities, errors, ports
 
 
@@ -29,6 +32,9 @@ class ConversationService:
     history_message_limit: int = 8
     turn_lease_seconds: int = 300
     answer_timeout_seconds: float = 240.0
+    overview_chunk_limit: int = 40
+    scan_chunk_limit: int = 20000
+    maximum_search_passes: int = 3
 
     async def create_chat(
         self,
@@ -42,6 +48,28 @@ class ConversationService:
             title_text=self._validated_title(title_text=title_text) if title_text is not None else None,
             project_identifier=project_identifier,
         )
+
+    async def rename_chat(
+        self, *, tenant_identity: entities.TenantIdentity, chat_identifier: uuid.UUID, title_text: str
+    ) -> entities.ChatRecord:
+        return await self.conversation_repository.rename_chat(
+            tenant_identifier=tenant_identity.user_identifier,
+            chat_identifier=chat_identifier,
+            title_text=self._validated_title(title_text=title_text),
+        )
+
+    async def delete_chat(self, *, tenant_identity: entities.TenantIdentity, chat_identifier: uuid.UUID) -> None:
+        await self.conversation_repository.delete_chat(
+            tenant_identifier=tenant_identity.user_identifier, chat_identifier=chat_identifier
+        )
+
+    def _validated_title(self, *, title_text: str) -> str:
+        normalized_title = title_text.strip()
+        if not normalized_title or len(normalized_title) > maximum_chat_title_characters:
+            raise errors.InvalidInputError(
+                error_code="invalid_chat_title", message_text="Chat title must contain 1 to 200 characters"
+            )
+        return normalized_title
 
     async def fetch_chat(
         self, *, tenant_identity: entities.TenantIdentity, chat_identifier: uuid.UUID
@@ -147,109 +175,102 @@ class ConversationService:
     async def _answer_reserved_turn(
         self, *, tenant_identity: entities.TenantIdentity, turn_record: entities.TurnRecord, question_text: str
     ) -> entities.AnswerRecord:
+        started_at = time.monotonic()
+        chat_record = await self.conversation_repository.fetch_chat(
+            tenant_identifier=tenant_identity.user_identifier,
+            chat_identifier=turn_record.chat_identifier,
+        )
         conversation_history: typing.Final = await self.conversation_repository.fetch_history(
             tenant_identifier=tenant_identity.user_identifier,
             chat_identifier=turn_record.chat_identifier,
             message_limit=self.history_message_limit,
         )
-        context_chunks: typing.Final = await self._retrieve_context(
-            tenant_identity=tenant_identity,
-            chat_identifier=turn_record.chat_identifier,
-            question_text=question_text,
-            conversation_history=conversation_history,
+        search_service = AdaptiveSearch(
+            document_repository=self.document_repository,
+            embedding_provider=self.embedding_provider,
+            vector_store=self.vector_store,
+            answer_generator=self.answer_generator,
+            retrieval_limit=self.retrieval_limit,
+            retrieval_candidates=self.retrieval_candidates,
+            minimum_similarity=self.minimum_similarity,
+            overview_chunk_limit=self.overview_chunk_limit,
+            scan_chunk_limit=self.scan_chunk_limit,
+            maximum_search_passes=self.maximum_search_passes,
         )
-        generated_answer = self._insufficient_answer(question_text=question_text)
-        citation_records: tuple[entities.CitationRecord, ...] = ()
-        if context_chunks:
-            generated_answer = await self.answer_generator.generate_answer(
-                question_text=question_text, conversation_history=conversation_history, context_chunks=context_chunks
+        search_result = (
+            None
+            if self._is_small_talk(question_text=question_text)
+            else await search_service.search_context(
+                tenant_identity=tenant_identity,
+                project_identifier=chat_record.project_identifier,
+                question_text=question_text,
+                conversation_history=conversation_history,
             )
+        )
+        context_chunks = search_result.context_chunks if search_result is not None else ()
+        if (
+            search_result is not None
+            and context_chunks
+            and search_result.search_plan.scope_name in {"overview", "expansion"}
+        ):
+            generated_answer = await search_service.compose_overview(
+                search_result=search_result,
+                conversation_history=conversation_history,
+                time_budget_seconds=max(1.0, self.answer_timeout_seconds - (time.monotonic() - started_at) - 15.0),
+            )
+        else:
+            generated_answer = await self.answer_generator.generate_answer(
+                question_text=question_text,
+                conversation_history=conversation_history,
+                context_chunks=context_chunks,
+            )
+            if search_result is not None and context_chunks and not generated_answer.sufficient_context:
+                expanded_result = await search_service.expand_context(
+                    search_result=search_result,
+                    tenant_identity=tenant_identity,
+                    project_identifier=chat_record.project_identifier,
+                    conversation_history=conversation_history,
+                )
+                if expanded_result.context_chunks != context_chunks:
+                    context_chunks = expanded_result.context_chunks
+                    generated_answer = await self.answer_generator.generate_answer(
+                        question_text=question_text,
+                        conversation_history=conversation_history,
+                        context_chunks=context_chunks,
+                    )
+        citation_records: tuple[entities.CitationRecord, ...] = ()
+        if context_chunks and generated_answer.sufficient_context:
             citation_records = self._build_citations(generated_answer=generated_answer, context_chunks=context_chunks)
-            if not generated_answer.sufficient_context:
-                generated_answer = self._insufficient_answer(question_text=question_text)
-                citation_records = ()
+        else:
+            if context_chunks:
+                generated_answer = await self.answer_generator.generate_answer(
+                    question_text=question_text,
+                    conversation_history=conversation_history,
+                    context_chunks=(),
+                )
+            if (
+                generated_answer.sufficient_context
+                or generated_answer.citation_identifiers
+                or not generated_answer.answer_text.strip()
+            ):
+                raise errors.DependencyUnavailableError(
+                    error_code="invalid_general_answer",
+                    message_text="A general answer must not claim document evidence",
+                )
+            knowledge_notice = (
+                "Ответ из знаний модели, без источников из материалов проекта."
+                if any("\u0400" <= character <= "\u04ff" for character in question_text)
+                else "Answer from model knowledge, without sources from project materials."
+            )
+            generated_answer = dataclasses.replace(
+                generated_answer, answer_text=f"> {knowledge_notice}\n\n{generated_answer.answer_text.strip()}"
+            )
         return await self.conversation_repository.complete_turn(
             tenant_identifier=tenant_identity.user_identifier,
             turn_record=turn_record,
             generated_answer=generated_answer,
             citation_records=citation_records,
         )
-
-    async def _retrieve_context(
-        self,
-        *,
-        tenant_identity: entities.TenantIdentity,
-        chat_identifier: uuid.UUID,
-        question_text: str,
-        conversation_history: tuple[entities.MessageRecord, ...],
-    ) -> tuple[entities.RetrievedChunk, ...]:
-        chat_record = await self.conversation_repository.fetch_chat(
-            tenant_identifier=tenant_identity.user_identifier,
-            chat_identifier=chat_identifier,
-        )
-        document_identifiers: typing.Final = await self.document_repository.fetch_ready_identifiers(
-            tenant_identifier=tenant_identity.user_identifier,
-            embedding_profile=self.embedding_provider.embedding_profile,
-            project_identifier=chat_record.project_identifier,
-        )
-        if not document_identifiers:
-            return ()
-        retrieval_question = question_text
-        if conversation_history:
-            retrieval_question = await self.answer_generator.rewrite_question(
-                question_text=question_text, conversation_history=conversation_history
-            )
-        question_vector: typing.Final = await self.embedding_provider.embed_question(question_text=retrieval_question)
-        vector_matches: typing.Final = await self.vector_store.search_chunks(
-            tenant_identifier=tenant_identity.user_identifier,
-            embedding_profile=self.embedding_provider.embedding_profile,
-            question_vector=question_vector,
-            document_identifiers=document_identifiers,
-            search_limit=self.retrieval_candidates,
-        )
-        accepted_matches: typing.Final = tuple(
-            vector_match for vector_match in vector_matches if vector_match.similarity_score >= self.minimum_similarity
-        )
-        if not accepted_matches:
-            return ()
-        chunk_records: typing.Final = await self.document_repository.fetch_ready_chunks(
-            tenant_identifier=tenant_identity.user_identifier,
-            embedding_profile=self.embedding_provider.embedding_profile,
-            project_identifier=chat_record.project_identifier,
-            chunk_identifiers=tuple(vector_match.chunk_identifier for vector_match in accepted_matches),
-        )
-        available_chunks: typing.Final = {chunk_record.chunk_identifier: chunk_record for chunk_record in chunk_records}
-        retrieved_chunks: typing.Final[list[entities.RetrievedChunk]] = []
-        available_documents: typing.Final[dict[uuid.UUID, entities.DocumentRecord]] = {}
-        for vector_match in accepted_matches:
-            chunk_record = available_chunks.get(vector_match.chunk_identifier)
-            if chunk_record is None or chunk_record.tenant_identifier != tenant_identity.user_identifier:
-                continue
-            document_record = available_documents.get(chunk_record.document_identifier)
-            if document_record is None:
-                try:
-                    document_record = await self.document_repository.fetch_document(
-                        tenant_identifier=tenant_identity.user_identifier,
-                        document_identifier=chunk_record.document_identifier,
-                    )
-                except errors.ResourceNotFoundError:
-                    continue
-                available_documents[chunk_record.document_identifier] = document_record
-            if (
-                document_record.state_name != entities.DocumentState.READY
-                or document_record.embedding_profile != self.embedding_provider.embedding_profile
-            ):
-                continue
-            retrieved_chunks.append(
-                entities.RetrievedChunk(
-                    chunk_record=chunk_record,
-                    filename_text=document_record.filename_text,
-                    similarity_score=vector_match.similarity_score,
-                )
-            )
-            if len(retrieved_chunks) == self.retrieval_limit:
-                break
-        return tuple(retrieved_chunks)
 
     def _build_citations(
         self, *, generated_answer: entities.GeneratedAnswer, context_chunks: tuple[entities.RetrievedChunk, ...]
@@ -280,19 +301,40 @@ class ConversationService:
             if context_chunk.chunk_record.chunk_identifier in cited_identifiers
         )
 
-    def _insufficient_answer(self, *, question_text: str) -> entities.GeneratedAnswer:
-        contains_cyrillic: typing.Final = any(
-            "\u0400" <= character_value <= "\u04ff" for character_value in question_text
-        )
-        answer_text: typing.Final = (
-            "В ваших материалах недостаточно информации для ответа. Загрузите подходящий документ или уточните вопрос."  # noqa: RUF001 -- Russian text.
-            if contains_cyrillic
-            else (
-                "Your materials do not provide enough information to answer. "
-                "Upload a relevant document or clarify the question."
-            )
-        )
-        return entities.GeneratedAnswer(answer_text=answer_text, sufficient_context=False, citation_identifiers=())
+    def _is_small_talk(self, *, question_text: str) -> bool:
+        normalized_question = re.sub(r"[^\w\s]", " ", question_text.casefold())
+        return " ".join(normalized_question.split()) in {
+            "привет",
+            "здравствуй",
+            "здравствуйте",
+            "добрый день",
+            "доброе утро",
+            "добрый вечер",
+            "как дела",
+            "привет как дела",
+            "спасибо",
+            "благодарю",
+            "пока",
+            "до свидания",
+            "до встречи",
+            "что ты умеешь",
+            "что ты можешь",
+            "чем ты можешь помочь",
+            "какие у тебя возможности",  # noqa: RUF001 - Russian user input
+            "расскажи о себе",  # noqa: RUF001 - Russian user input
+            "кто ты",
+            "hi",
+            "hello",
+            "hey",
+            "how are you",
+            "hi how are you",
+            "thanks",
+            "thank you",
+            "bye",
+            "goodbye",
+            "what can you do",
+            "who are you",
+        }
 
     async def _fail_reserved_turn(
         self, *, tenant_identity: entities.TenantIdentity, turn_record: entities.TurnRecord, error_code: str
@@ -305,25 +347,3 @@ class ConversationService:
             application_logger.exception(
                 "Could not fail turn %s; lease recovery remains available", turn_record.turn_identifier
             )
-
-    async def rename_chat(
-        self, *, tenant_identity: entities.TenantIdentity, chat_identifier: uuid.UUID, title_text: str
-    ) -> entities.ChatRecord:
-        return await self.conversation_repository.rename_chat(
-            tenant_identifier=tenant_identity.user_identifier,
-            chat_identifier=chat_identifier,
-            title_text=self._validated_title(title_text=title_text),
-        )
-
-    async def delete_chat(self, *, tenant_identity: entities.TenantIdentity, chat_identifier: uuid.UUID) -> None:
-        await self.conversation_repository.delete_chat(
-            tenant_identifier=tenant_identity.user_identifier, chat_identifier=chat_identifier
-        )
-
-    def _validated_title(self, *, title_text: str) -> str:
-        normalized_title = title_text.strip()
-        if not normalized_title or len(normalized_title) > maximum_chat_title_characters:
-            raise errors.InvalidInputError(
-                error_code="invalid_chat_title", message_text="Chat title must contain 1 to 200 characters"
-            )
-        return normalized_title

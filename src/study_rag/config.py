@@ -47,6 +47,9 @@ class Settings(pydantic_settings.BaseSettings):
     chunk_overlap_tokens: int = pydantic.Field(default=64, ge=0)
     retrieval_limit: int = pydantic.Field(default=6, ge=1, le=24)
     retrieval_candidates: int = pydantic.Field(default=24, ge=1, le=100)
+    overview_chunk_limit: int = pydantic.Field(default=40, ge=8, le=48)
+    scan_chunk_limit: int = pydantic.Field(default=20000, ge=256, le=100000)
+    maximum_search_passes: int = pydantic.Field(default=3, ge=1, le=4)
     minimum_similarity: float = pydantic.Field(default=0.35, ge=-1.0, le=1.0)
     worker_poll_seconds: float = pydantic.Field(default=1.0, gt=0.0)
     document_lease_seconds: int = pydantic.Field(default=120, ge=10)
@@ -55,7 +58,7 @@ class Settings(pydantic_settings.BaseSettings):
     generation_timeout_seconds: float = pydantic.Field(default=120.0, gt=0.0)
     answer_timeout_seconds: float = pydantic.Field(default=240.0, gt=0.0)
     generation_context_tokens: int = pydantic.Field(default=16384, ge=2048)
-    generation_output_tokens: int = pydantic.Field(default=512, ge=16)
+    generation_output_tokens: int = pydantic.Field(default=2048, ge=16)
     history_message_limit: int = pydantic.Field(default=8, ge=0, le=40)
 
     @pydantic.field_validator("jwt_secret")
