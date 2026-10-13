@@ -96,6 +96,16 @@ class DocumentRecord:
     error_message: str | None
     created_at: datetime.datetime
     updated_at: datetime.datetime
+    indexed_chunk_count: int = 0
+
+    @property
+    def indexing_progress_percent(self) -> int:
+        if self.state_name == DocumentState.READY:
+            return 100
+        if self.chunk_count == 0:
+            return 0
+        # Final publication is a separate transaction; 100% means searchable.
+        return min(99, self.indexed_chunk_count * 100 // self.chunk_count)
 
 
 @typing.final
@@ -104,6 +114,15 @@ class DocumentLease:
     document_record: DocumentRecord
     lease_identifier: uuid.UUID
     action_name: typing.Literal["index", "delete"]
+
+
+@typing.final
+@dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
+class DocumentContent:
+    filename_text: str
+    media_type: str
+    content_bytes: bytes
+    page_count: int | None
 
 
 @typing.final

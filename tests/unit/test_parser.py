@@ -1,4 +1,5 @@
 import io
+import unittest.mock
 
 import pypdf
 import pypdf.generic
@@ -60,6 +61,49 @@ async def test_parser_preserves_pdf_page_numbers_across_blank_page() -> None:
     assert extracted_document.page_count == 3  # noqa: PLR2004 -- fixture has exactly three PDF pages.
     assert tuple(text_section.page_number for text_section in extracted_document.text_sections) == (1, 3)
     assert "Last page" in extracted_document.text_sections[-1].content_text
+
+
+async def test_pdf_words_follow_visual_lines_and_preserve_paragraphs() -> None:
+    document_reader = pypdf.PdfReader(io.BytesIO(build_text_pdf(page_texts=("Seed",))))
+    document_page = document_reader.pages[0]
+    content_stream = pypdf.generic.DecodedStreamObject()
+    content_stream.set_data(
+        b"BT /F1 12 Tf 1 0 0 1 10 220 Tm (Format) Tj ET\n"
+        b"BT /F1 12 Tf 1 0 0 1 60 220 Tm (data:) Tj ET\n"
+        b"BT /F1 12 Tf 1 0 0 1 10 170 Tm (Column) Tj ET\n"
+        b"BT /F1 12 Tf 1 0 0 1 150 170 Tm (Description) Tj ET\n"
+        b"BT /F1 12 Tf 1 0 0 1 10 150 Tm (query) Tj ET\n"
+        b"BT /F1 12 Tf 1 0 0 1 150 150 Tm (Search query text) Tj ET\n"
+    )
+    document_page[pypdf.generic.NameObject("/Contents")] = content_stream
+    document_writer = pypdf.PdfWriter()
+    document_writer.add_page(document_page)
+    output_stream = io.BytesIO()
+    document_writer.write(output_stream)
+    extracted_document = await PypdfDocumentParser().extract_document(
+        content_bytes=output_stream.getvalue(), media_type="application/pdf"
+    )
+    extracted_text = extracted_document.text_sections[0].content_text
+    assert extracted_text.splitlines()[0].split() == ["Format", "data:"]
+    assert "\n\nColumn" in extracted_text
+    assert any(
+        "Column" in content_line and "Description" in content_line for content_line in extracted_text.splitlines()
+    )
+    assert any(
+        "query" in content_line and "Search query text" in content_line for content_line in extracted_text.splitlines()
+    )
+    assert all(not content_line.startswith(" ") for content_line in extracted_text.splitlines())
+
+
+@pytest.mark.parametrize("layout_failure", [ValueError("Unsupported layout"), ""])
+async def test_pdf_layout_failure_keeps_plain_text_fallback(layout_failure: ValueError | str) -> None:
+    with unittest.mock.patch.object(
+        pypdf.PageObject, "extract_text", side_effect=[layout_failure, "Readable fallback"]
+    ):
+        extracted_document = await PypdfDocumentParser().extract_document(
+            content_bytes=build_text_pdf(page_texts=("Seed",)), media_type="application/pdf"
+        )
+    assert extracted_document.text_sections[0].content_text == "Readable fallback"
 
 
 @pytest.mark.parametrize(

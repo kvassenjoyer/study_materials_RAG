@@ -72,7 +72,7 @@ class DocumentRepository(typing.Protocol):
     ) -> entities.DocumentRecord: ...
 
     async def retry_indexing(
-        self, *, tenant_identifier: uuid.UUID, document_identifier: uuid.UUID
+        self, *, tenant_identifier: uuid.UUID, document_identifier: uuid.UUID, rebuild_requested: bool = False
     ) -> entities.DocumentRecord: ...
 
     async def claim_document(
@@ -90,6 +90,10 @@ class DocumentRepository(typing.Protocol):
     ) -> None: ...
 
     async def complete_indexing(self, *, document_lease: entities.DocumentLease) -> None: ...
+
+    async def update_indexing_progress(
+        self, *, document_lease: entities.DocumentLease, indexed_chunk_count: int
+    ) -> None: ...
 
     async def fail_indexing(
         self, *, document_lease: entities.DocumentLease, error_code: str, error_message: str

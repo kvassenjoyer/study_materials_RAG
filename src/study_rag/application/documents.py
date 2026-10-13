@@ -92,6 +92,24 @@ class DocumentService:
             project_identifier=project_identifier,
         )
 
+    async def load_original_pdf(
+        self, *, tenant_identity: entities.TenantIdentity, document_identifier: uuid.UUID
+    ) -> entities.DocumentContent:
+        document_record = await self.document_repository.fetch_document(
+            tenant_identifier=tenant_identity.user_identifier, document_identifier=document_identifier
+        )
+        if document_record.state_name in {entities.DocumentState.DELETING, entities.DocumentState.DELETED}:
+            raise errors.ResourceNotFoundError(error_code="document_not_found", message_text="Document not found")
+        if document_record.media_type != "application/pdf":
+            raise errors.InvalidInputError(error_code="document_not_pdf", message_text="The document is not a PDF")
+        content_bytes = await self.file_storage.load_document(storage_key=document_record.storage_key)
+        return entities.DocumentContent(
+            filename_text=document_record.filename_text,
+            media_type=document_record.media_type,
+            content_bytes=content_bytes,
+            page_count=document_record.page_count,
+        )
+
     async def fetch_chunk(
         self, *, tenant_identity: entities.TenantIdentity, chunk_identifier: uuid.UUID
     ) -> entities.RetrievedChunk:
@@ -107,10 +125,16 @@ class DocumentService:
         )
 
     async def retry_document(
-        self, *, tenant_identity: entities.TenantIdentity, document_identifier: uuid.UUID
+        self,
+        *,
+        tenant_identity: entities.TenantIdentity,
+        document_identifier: uuid.UUID,
+        rebuild_requested: bool = False,
     ) -> entities.DocumentRecord:
         return await self.document_repository.retry_indexing(
-            tenant_identifier=tenant_identity.user_identifier, document_identifier=document_identifier
+            tenant_identifier=tenant_identity.user_identifier,
+            document_identifier=document_identifier,
+            rebuild_requested=rebuild_requested,
         )
 
     def _normalize_filename(self, *, filename_text: str) -> str:

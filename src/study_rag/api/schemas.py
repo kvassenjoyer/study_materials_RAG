@@ -50,6 +50,8 @@ class DocumentResponse(ResponseModel):
     byte_count: int
     state_name: entities.DocumentState
     chunk_count: int
+    indexed_chunk_count: int
+    indexing_progress_percent: int = pydantic.Field(ge=0, le=100)
     page_count: int | None
     embedding_profile: str
     error_code: str | None
@@ -62,6 +64,7 @@ class DocumentResponse(ResponseModel):
 class IndexingRequest(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
     document_identifier: uuid.UUID
+    rebuild: bool = False
 
 
 @typing.final

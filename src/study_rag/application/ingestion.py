@@ -134,6 +134,9 @@ class IngestionWorker:
                 embedding_profile=document_record.embedding_profile,
                 embedded_chunks=embedded_chunks,
             )
+            await self.document_repository.update_indexing_progress(
+                document_lease=document_lease, indexed_chunk_count=batch_offset + len(batch_records)
+            )
         await self._ensure_lease(document_lease=document_lease)
         await self.document_repository.complete_indexing(document_lease=document_lease)
 

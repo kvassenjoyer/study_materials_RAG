@@ -2,6 +2,22 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiClient, ApiError, errorText } from './api';
 
 describe('REST transport', () => {
+  it('loads original PDFs with bearer headers and page metadata without putting credentials in the URL', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response('%PDF-original', { headers: { 'Content-Type': 'application/pdf', 'X-PDF-Page-Count': '2' } }));
+    const result = await new ApiClient('test-bearer', () => {}, fetcher).originalPdf('document-id');
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/rest/study-rag/documents/document-id/original/');
+    expect(String(url)).not.toContain('test-bearer');
+    expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-bearer');
+    expect(result.pageCount).toBe(2);
+    expect(await result.blob.text()).toBe('%PDF-original');
+  });
+
+  it('rejects a proxy HTML page instead of displaying it as the PDF original', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response('<html>Error</html>', { headers: { 'Content-Type': 'text/html' } }));
+    await expect(new ApiClient('test-bearer', () => {}, fetcher).originalPdf('document-id')).rejects.toMatchObject({ code: 'invalid_pdf_original' });
+  });
+
   it.each([true, false])('authenticates with a login JSON field (register: %s)', async register => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ access_token: 'test-token', expires_in: 3600, token_type: 'bearer' }));
     await new ApiClient(null, () => {}, fetcher).authenticate('student_123', 'fixture-password', register);

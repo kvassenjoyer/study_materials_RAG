@@ -161,4 +161,14 @@ export class ApiClient {
     return this.request<DocumentRecord>(`/documents/${encodeURIComponent(id)}/`, { method: 'DELETE', signal });
   }
   chunk(id: string, signal?: AbortSignal) { return this.request<ChunkRecord>(`/chunks/${encodeURIComponent(id)}/`, { signal }); }
+  async originalPdf(id: string, signal?: AbortSignal): Promise<{ blob: Blob; pageCount: number | null }> {
+    const headers = new Headers();
+    if (this.token) headers.set('Authorization', `Bearer ${this.token}`);
+    const response = await this.transport(apiUrl(`${prefix}/documents/${encodeURIComponent(id)}/original/`), { headers, signal });
+    if (response.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase() !== 'application/pdf') {
+      throw new ApiError(502, 'invalid_pdf_original', 'Unexpected original document type');
+    }
+    const count = Number(response.headers.get('X-PDF-Page-Count'));
+    return { blob: await response.blob(), pageCount: Number.isSafeInteger(count) && count > 0 ? count : null };
+  }
 }

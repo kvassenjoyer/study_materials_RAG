@@ -14,7 +14,7 @@ import uuid
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Connection, column, func, insert, inspect, select, table, text, update
+from sqlalchemy import Connection, MetaData, Table, column, func, insert, inspect, select, table, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from study_rag.adapters import database
@@ -24,6 +24,7 @@ from study_rag.adapters.repositories import (
     PostgreSQLDocumentRepository,
 )
 from study_rag.adapters.repositories.projects import PostgreSQLProjectRepository
+from study_rag.api.schemas import DocumentResponse
 from study_rag.domain import entities, errors
 
 
@@ -158,6 +159,60 @@ async def test_initial_migration_creates_all_tables(repository_harness: Reposito
         "chat_turns",
         "chat_messages",
     }
+
+
+async def test_progress_migration_backfills_ready_documents_and_preserves_existing_fields(
+    empty_database_engine: AsyncEngine,
+) -> None:
+    async with empty_database_engine.begin() as connection:
+        await connection.run_sync(apply_test_migration, "c8f4b23e015a")
+        previous_documents = await connection.run_sync(
+            lambda database_connection: Table("documents", MetaData(), autoload_with=database_connection)
+        )
+    session_factory = async_sessionmaker(empty_database_engine, expire_on_commit=False)
+    account_record = await PostgreSQLAuthRepository(session_factory=session_factory).create_account(
+        login_name="progress-migration@example.test", password_hash="fixture-hash"
+    )
+    project_record = await PostgreSQLProjectRepository(session_factory=session_factory).create_project(
+        tenant_identifier=account_record.user_identifier, title_text="Existing materials"
+    )
+    timestamp_value = datetime.datetime.now(datetime.UTC)
+    document_identifier = uuid.uuid4()
+    async with empty_database_engine.begin() as connection:
+        await connection.execute(
+            insert(previous_documents).values(
+                document_identifier=document_identifier,
+                tenant_identifier=account_record.user_identifier,
+                project_identifier=project_record.project_identifier,
+                filename_text="existing-book.pdf",
+                media_type="application/pdf",
+                storage_key="fixture/book",
+                content_digest="a" * 64,
+                byte_count=8000000,
+                embedding_profile="fixture-profile",
+                state_name="ready",
+                chunk_count=123,
+                page_count=535,
+                next_attempt_at=timestamp_value,
+                attempts=1,
+                created_at=timestamp_value,
+                updated_at=timestamp_value,
+            )
+        )
+        previous_record = (await connection.execute(select(previous_documents))).mappings().one()
+        await connection.run_sync(apply_test_migration)
+        current_record = (await connection.execute(select(database.DocumentRow))).mappings().one()
+        assert current_record["indexed_chunk_count"] == previous_record["chunk_count"]
+        assert {column_name: current_record[column_name] for column_name in previous_record} == dict(previous_record)
+
+        def downgrade_progress(database_connection: Connection) -> None:
+            configuration = Config("alembic.ini")
+            configuration.attributes["connection"] = database_connection
+            command.downgrade(configuration, "c8f4b23e015a")
+
+        await connection.run_sync(downgrade_progress)
+        downgraded_record = (await connection.execute(select(previous_documents))).mappings().one()
+        assert dict(downgraded_record) == dict(previous_record)
 
 
 async def test_automatic_chat_title_is_set_once_and_manual_name_wins(repository_harness: RepositoryHarness) -> None:
@@ -549,6 +604,12 @@ async def test_partial_index_not_visible_and_ready_chunks_are_tenant_scoped(
 async def test_expired_lease_reclaimed_after_repository_restart(repository_harness: RepositoryHarness) -> None:
     document_record = await registered_fixture(repository_harness)
     original_lease = await claim_fixture(repository_harness)
+    await repository_harness.document_repository.replace_chunks(
+        document_lease=original_lease, chunk_records=(chunk_fixture(document_record),), page_count=1
+    )
+    await repository_harness.document_repository.update_indexing_progress(
+        document_lease=original_lease, indexed_chunk_count=1
+    )
     await expire_document_lease(repository_harness, original_lease)
     reopened_repository = PostgreSQLDocumentRepository(session_factory=repository_harness.session_factory)
 
@@ -557,6 +618,10 @@ async def test_expired_lease_reclaimed_after_repository_restart(repository_harne
     assert recovered_lease is not None
     assert recovered_lease.document_record.document_identifier == document_record.document_identifier
     assert recovered_lease.lease_identifier != original_lease.lease_identifier
+    assert recovered_lease.document_record.indexed_chunk_count == 0
+    assert recovered_lease.document_record.indexing_progress_percent == 0
+    with pytest.raises(errors.LeaseLostError):
+        await reopened_repository.update_indexing_progress(document_lease=original_lease, indexed_chunk_count=1)
     assert not await reopened_repository.renew_lease(document_lease=original_lease, lease_seconds=120)
     with pytest.raises(errors.LeaseLostError):
         await reopened_repository.replace_chunks(
@@ -567,6 +632,154 @@ async def test_expired_lease_reclaimed_after_repository_restart(repository_harne
     with pytest.raises(errors.LeaseLostError):
         await reopened_repository.fail_indexing(
             document_lease=original_lease, error_code="late_failure", error_message="stale"
+        )
+
+
+async def test_indexing_progress_persists_and_reaches_100_only_when_ready(
+    repository_harness: RepositoryHarness,
+) -> None:
+    document_record = await registered_fixture(repository_harness)
+    document_lease = await claim_fixture(repository_harness)
+    chunk_records = tuple(
+        dataclasses.replace(chunk_fixture(document_record), ordinal_value=ordinal_value) for ordinal_value in range(3)
+    )
+    await repository_harness.document_repository.replace_chunks(
+        document_lease=document_lease, chunk_records=chunk_records, page_count=3
+    )
+    await repository_harness.document_repository.update_indexing_progress(
+        document_lease=document_lease, indexed_chunk_count=1
+    )
+    reopened_repository = PostgreSQLDocumentRepository(session_factory=repository_harness.session_factory)
+    progress_record = await reopened_repository.fetch_document(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    expected_percent = 33
+    assert progress_record.indexed_chunk_count == 1
+    assert progress_record.indexing_progress_percent == expected_percent
+    assert (
+        DocumentResponse.model_validate(progress_record).model_dump()["indexing_progress_percent"] == expected_percent
+    )
+    await reopened_repository.update_indexing_progress(document_lease=document_lease, indexed_chunk_count=0)
+    for invalid_count in (-1, 4):
+        with pytest.raises(errors.InvalidInputError):
+            await reopened_repository.update_indexing_progress(
+                document_lease=document_lease, indexed_chunk_count=invalid_count
+            )
+    unchanged_record = await reopened_repository.fetch_document(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    assert unchanged_record.indexed_chunk_count == 1
+    await reopened_repository.update_indexing_progress(
+        document_lease=document_lease, indexed_chunk_count=len(chunk_records)
+    )
+    finalizing_record = await reopened_repository.fetch_document(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    finalizing_percent = 99
+    assert finalizing_record.indexing_progress_percent == finalizing_percent
+    assert (
+        await reopened_repository.fetch_ready_identifiers(
+            tenant_identifier=document_record.tenant_identifier,
+            project_identifier=document_record.project_identifier,
+            embedding_profile=document_record.embedding_profile,
+        )
+        == ()
+    )
+    await reopened_repository.complete_indexing(document_lease=document_lease)
+    ready_record = await reopened_repository.fetch_document(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    complete_percent = 100
+    assert ready_record.indexing_progress_percent == complete_percent
+    assert ready_record.indexed_chunk_count == len(chunk_records)
+
+
+async def test_ready_rebuild_requires_explicit_flag_and_keeps_ownership(repository_harness: RepositoryHarness) -> None:
+    document_record = await registered_fixture(repository_harness)
+    document_lease = await claim_fixture(repository_harness)
+    await repository_harness.document_repository.replace_chunks(
+        document_lease=document_lease, chunk_records=(chunk_fixture(document_record),), page_count=2
+    )
+    await repository_harness.document_repository.complete_indexing(document_lease=document_lease)
+    with pytest.raises(errors.ResourceConflictError):
+        await repository_harness.document_repository.retry_indexing(
+            tenant_identifier=document_record.tenant_identifier,
+            document_identifier=document_record.document_identifier,
+        )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository_harness.document_repository.retry_indexing(
+            tenant_identifier=uuid.uuid4(),
+            document_identifier=document_record.document_identifier,
+            rebuild_requested=True,
+        )
+    rebuilt_record = await repository_harness.document_repository.retry_indexing(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+        rebuild_requested=True,
+    )
+    assert rebuilt_record.state_name == entities.DocumentState.QUEUED
+    assert rebuilt_record.indexed_chunk_count == 0
+    assert rebuilt_record.document_identifier == document_record.document_identifier
+    repeated_record = await repository_harness.document_repository.retry_indexing(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+        rebuild_requested=True,
+    )
+    assert repeated_record == rebuilt_record
+    await repository_harness.document_repository.request_deletion(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    with pytest.raises(errors.ResourceConflictError):
+        await repository_harness.document_repository.retry_indexing(
+            tenant_identifier=document_record.tenant_identifier,
+            document_identifier=document_record.document_identifier,
+            rebuild_requested=True,
+        )
+
+
+async def test_retry_clears_failed_progress_and_deletion_revokes_updates(repository_harness: RepositoryHarness) -> None:
+    document_record = await registered_fixture(repository_harness)
+    indexing_lease = await claim_fixture(repository_harness)
+    chunk_records = tuple(
+        dataclasses.replace(chunk_fixture(document_record), ordinal_value=ordinal_value) for ordinal_value in range(2)
+    )
+    await repository_harness.document_repository.replace_chunks(
+        document_lease=indexing_lease, chunk_records=chunk_records, page_count=2
+    )
+    await repository_harness.document_repository.update_indexing_progress(
+        document_lease=indexing_lease, indexed_chunk_count=1
+    )
+    await repository_harness.document_repository.fail_indexing(
+        document_lease=indexing_lease, error_code="fixture", error_message="fixture"
+    )
+    failed_record = await repository_harness.document_repository.fetch_document(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    assert failed_record.indexed_chunk_count == 1
+    retried_record = await repository_harness.document_repository.retry_indexing(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    assert retried_record.indexed_chunk_count == 0
+    retry_lease = await claim_fixture(repository_harness)
+    await repository_harness.document_repository.request_deletion(
+        tenant_identifier=document_record.tenant_identifier,
+        document_identifier=document_record.document_identifier,
+    )
+    with pytest.raises(errors.LeaseLostError):
+        await repository_harness.document_repository.update_indexing_progress(
+            document_lease=retry_lease, indexed_chunk_count=0
+        )
+    deletion_lease = await claim_fixture(repository_harness)
+    with pytest.raises(errors.LeaseLostError):
+        await repository_harness.document_repository.update_indexing_progress(
+            document_lease=deletion_lease, indexed_chunk_count=0
         )
 
 

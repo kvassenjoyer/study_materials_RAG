@@ -45,6 +45,7 @@ class PostgreSQLDocumentRepository:
             embedding_profile=document_registration.embedding_profile,
             state_name="queued",
             chunk_count=0,
+            indexed_chunk_count=0,
             page_count=None,
             next_attempt_at=timestamp_value,
             attempts=0,
@@ -236,6 +237,7 @@ class PostgreSQLDocumentRepository:
         *,
         tenant_identifier: uuid.UUID,
         document_identifier: uuid.UUID,
+        rebuild_requested: bool = False,
     ) -> entities.DocumentRecord:
         async with self._session_scope.transaction_session() as database_session:
             document_row: typing.Final = await self._owned_document(
@@ -246,11 +248,12 @@ class PostgreSQLDocumentRepository:
             )
             if document_row.state_name in ("queued", "indexing"):
                 return mapping.document_record(document_row)
-            if document_row.state_name != "failed":
+            if document_row.state_name != "failed" and not (rebuild_requested and document_row.state_name == "ready"):
                 raise errors.ResourceConflictError(
                     error_code="document_not_retryable", message_text="Document cannot be retried"
                 )
             document_row.state_name = "queued"
+            document_row.indexed_chunk_count = 0
             document_row.error_code = None
             document_row.error_message = None
             document_row.next_attempt_at = datetime.datetime.now(datetime.UTC)
@@ -292,6 +295,7 @@ class PostgreSQLDocumentRepository:
             )
             if action_name == "index":
                 document_row.state_name = "indexing"
+                document_row.indexed_chunk_count = 0
                 document_row.chunk_count = 0
             document_row.lease_identifier = uuid.uuid4()
             document_row.worker_identifier = worker_identifier
@@ -346,7 +350,23 @@ class PostgreSQLDocumentRepository:
             )
             database_session.add_all(mapping.chunk_database_row(one_chunk_record) for one_chunk_record in chunk_records)
             document_row.chunk_count = len(chunk_records)
+            document_row.indexed_chunk_count = 0
             document_row.page_count = page_count
+            document_row.updated_at = datetime.datetime.now(datetime.UTC)
+
+    async def update_indexing_progress(
+        self, *, document_lease: entities.DocumentLease, indexed_chunk_count: int
+    ) -> None:
+        if document_lease.action_name != "index":
+            raise errors.LeaseLostError(error_code="lease_lost", message_text="Indexing lease is no longer valid")
+        async with self._session_scope.transaction_session() as database_session:
+            document_row = await self._leased_document(database_session=database_session, document_lease=document_lease)
+            if not 0 <= indexed_chunk_count <= document_row.chunk_count:
+                raise errors.InvalidInputError(
+                    error_code="invalid_indexing_progress",
+                    message_text="Indexed count must fit the document chunk count",
+                )
+            document_row.indexed_chunk_count = max(document_row.indexed_chunk_count, indexed_chunk_count)
             document_row.updated_at = datetime.datetime.now(datetime.UTC)
 
     async def complete_indexing(self, *, document_lease: entities.DocumentLease) -> None:
@@ -361,6 +381,7 @@ class PostgreSQLDocumentRepository:
                     error_code="no_chunks", message_text="An empty document cannot become ready"
                 )
             document_row.state_name = "ready"
+            document_row.indexed_chunk_count = document_row.chunk_count
             document_row.error_code = None
             document_row.error_message = None
             self._release_lease(document_row=document_row)
@@ -396,6 +417,7 @@ class PostgreSQLDocumentRepository:
             )
             document_row.state_name = "deleted"
             document_row.chunk_count = 0
+            document_row.indexed_chunk_count = 0
             document_row.error_code = None
             document_row.error_message = None
             document_row.updated_at = datetime.datetime.now(datetime.UTC)

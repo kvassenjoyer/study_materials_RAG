@@ -6,6 +6,7 @@ export interface DocumentRecord {
   project_identifier: string;
   document_identifier: string; filename_text: string; media_type: string; byte_count: number;
   state_name: DocumentState; chunk_count: number; page_count: number | null;
+  indexed_chunk_count: number; indexing_progress_percent: number;
   embedding_profile: string; error_code: string | null; error_message: string | null;
   created_at: string; updated_at: string;
 }

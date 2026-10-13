@@ -29,7 +29,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from study_rag.domain.errors import DependencyUnavailableError
 
 
-_REQUIRED_SCHEMA_REVISION: typing.Final = "c8f4b23e015a"
+_REQUIRED_SCHEMA_REVISION: typing.Final = "d9a5c34f126b"
 
 
 @typing.final
@@ -95,6 +95,7 @@ class DocumentRow(DatabaseBase):
         ),
         CheckConstraint("state_name IN ('queued','indexing','ready','failed','deleting','deleted')", name="state_name"),
         CheckConstraint("chunk_count >= 0 AND byte_count >= 0 AND attempts >= 0", name="positive_counts"),
+        CheckConstraint("indexed_chunk_count >= 0 AND indexed_chunk_count <= chunk_count", name="indexing_counts"),
         Index("ix_documents_tenant_created", "tenant_identifier", "created_at"),
         Index("ix_documents_claim", "state_name", "next_attempt_at", "lease_expires_at"),
         Index(
@@ -119,6 +120,7 @@ class DocumentRow(DatabaseBase):
     embedding_profile: Mapped[str] = mapped_column(Text)
     state_name: Mapped[str] = mapped_column(String(16))
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    indexed_chunk_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     page_count: Mapped[int | None] = mapped_column(Integer)
     lease_identifier: Mapped[uuid.UUID | None]
     lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))

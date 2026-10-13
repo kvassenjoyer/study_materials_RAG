@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import re
 import typing
 
 import pypdf
@@ -80,7 +81,7 @@ class PypdfDocumentParser:
                     raise errors.InvalidInputError(
                         error_code="pdf_page_too_large", message_text="A PDF page exceeds its extraction limit."
                     )
-                content_text = document_page.extract_text() or ""
+                content_text = self._extract_page_text(document_page=document_page)
                 total_characters += len(content_text)
                 if total_characters > self._maximum_characters:
                     raise errors.InvalidInputError(
@@ -99,6 +100,18 @@ class PypdfDocumentParser:
                 message_text="The PDF has no extractable text layer; scanned PDFs require OCR.",
             )
         return entities.ExtractedDocument(text_sections=tuple(text_sections), page_count=page_count)
+
+    def _extract_page_text(self, *, document_page: pypdf.PageObject) -> str:
+        try:
+            content_text = document_page.extract_text(extraction_mode="layout", layout_mode_strip_rotated=False) or ""
+        except (pypdf.errors.PyPdfError, ValueError, TypeError, KeyError):
+            # Some font/rotation combinations cannot be reconstructed in layout mode.
+            content_text = ""
+        if not content_text.strip():
+            content_text = document_page.extract_text() or ""
+        # PDF coordinates are visual alignment, not Markdown code indentation.
+        normalized_lines = "\n".join(content_line.strip() for content_line in content_text.splitlines())
+        return re.sub(r"\n{3,}", "\n\n", normalized_lines).strip()
 
     def _validate_text(self, *, content_text: str) -> None:
         if not content_text.strip():

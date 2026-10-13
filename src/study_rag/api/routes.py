@@ -1,6 +1,7 @@
 """Thin, tenant-scoped REST endpoints for the study-materials service."""
 
 import typing
+import urllib.parse
 import uuid
 
 import fastapi
@@ -132,8 +133,32 @@ async def retry_document(
     document_record: typing.Final = await application_resources.document_service.retry_document(
         tenant_identity=tenant_identity,
         document_identifier=indexing_request.document_identifier,
+        rebuild_requested=indexing_request.rebuild,
     )
     return schemas.DocumentResponse.model_validate(document_record)
+
+
+@api_router.get("/documents/{document_identifier}/original/", tags=["documents"])
+async def fetch_original_pdf(
+    *,
+    document_identifier: uuid.UUID,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> fastapi.Response:
+    document_content = await application_resources.document_service.load_original_pdf(
+        tenant_identity=tenant_identity, document_identifier=document_identifier
+    )
+    encoded_filename = urllib.parse.quote(document_content.filename_text, safe="")
+    response_headers = {
+        "Content-Disposition": f"inline; filename*=UTF-8''{encoded_filename}",
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if document_content.page_count is not None:
+        response_headers["X-PDF-Page-Count"] = str(document_content.page_count)
+    return fastapi.Response(
+        content=document_content.content_bytes, media_type="application/pdf", headers=response_headers
+    )
 
 
 @api_router.get("/chunks/{chunk_identifier}/", response_model=schemas.ChunkResponse, tags=["documents"])

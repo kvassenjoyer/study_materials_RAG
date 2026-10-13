@@ -20,13 +20,17 @@ from study_rag.application.ingestion import IngestionWorker
 from study_rag.application.projects import ProjectService
 from study_rag.bootstrap import ApplicationResources
 from study_rag.config import Settings
-from study_rag.domain import entities, ports
+from study_rag.domain import entities, errors, ports
 from study_rag.main import create_application
 
 
 @pytest.fixture
 def document_service() -> unittest.mock.Mock:
-    return unittest.mock.Mock(spec=DocumentService)
+    service_mock = unittest.mock.Mock(spec=DocumentService)
+    service_mock.load_original_pdf.return_value = entities.DocumentContent(
+        filename_text="Учебник.pdf", media_type="application/pdf", content_bytes=b"%PDF-original", page_count=2
+    )
+    return service_mock
 
 
 @pytest.fixture
@@ -103,6 +107,37 @@ async def test_current_user_exposes_login_instead_of_email(api_client: httpx.Asy
     assert response_value.status_code == http.HTTPStatus.OK
     assert response_value.json()["login_name"] == "student@example.com"
     assert "email_address" not in response_value.json()
+
+
+async def test_original_pdf_is_private_binary_with_safe_unicode_filename(api_client: httpx.AsyncClient) -> None:
+    response_value = await api_client.get(
+        f"/rest/study-rag/documents/{uuid.uuid4()}/original/", headers={"Authorization": "Bearer fixture"}
+    )
+    assert response_value.status_code == http.HTTPStatus.OK
+    assert response_value.content == b"%PDF-original"
+    assert response_value.headers["content-type"] == "application/pdf"
+    assert response_value.headers["cache-control"] == "private, no-store"
+    assert response_value.headers["x-content-type-options"] == "nosniff"
+    assert response_value.headers["x-pdf-page-count"] == "2"
+    assert response_value.headers["content-disposition"].startswith("inline; filename*=UTF-8''%")
+
+
+async def test_original_pdf_without_bearer_is_denied(api_client: httpx.AsyncClient) -> None:
+    response_value = await api_client.get(f"/rest/study-rag/documents/{uuid.uuid4()}/original/")
+    assert response_value.status_code == http.HTTPStatus.UNAUTHORIZED
+
+
+async def test_original_pdf_has_uniform_foreign_document_error(
+    api_client: httpx.AsyncClient, document_service: unittest.mock.Mock
+) -> None:
+    document_service.load_original_pdf.side_effect = errors.ResourceNotFoundError(
+        error_code="document_not_found", message_text="Document not found"
+    )
+    response_value = await api_client.get(
+        f"/rest/study-rag/documents/{uuid.uuid4()}/original/", headers={"Authorization": "Bearer fixture"}
+    )
+    assert response_value.status_code == http.HTTPStatus.NOT_FOUND
+    assert response_value.json() == {"error_code": "document_not_found", "message_text": "Document not found"}
 
 
 async def test_client_cannot_supply_tenant_in_question(api_client: httpx.AsyncClient) -> None:

@@ -10,6 +10,7 @@ import { Markdown } from './components/Markdown';
 import { SourceDialog, Sources } from './components/Sources';
 import { ProjectSwitcher } from './components/ProjectSwitcher';
 import { ManagementDialog } from './components/ManagementDialog';
+import { IndexingProgress } from './components/IndexingProgress';
 
 const date = (value: string) => new Intl.DateTimeFormat('ru', { day: 'numeric', month: 'short' }).format(new Date(value));
 const fileSize = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} МБ` : `${Math.max(1, Math.round(bytes / 1024))} КБ`;
@@ -297,7 +298,7 @@ function ProjectWorkspace({ api, token, identity, onLogout, project, projects, o
         {libraryLoading ? <p className="sidebar-empty" role="status">Загружаю материалы…</p> : !documents.length ? null : <ul className="document-list">{documents.map(document => <li className="document-item" key={document.document_identifier}>
           <span className="file-icon"><Icon name="file" size={19}/></span><div className="document-info"><span className="document-name" title={document.filename_text}>{document.filename_text}</span>
             <span className="document-details">{fileSize(document.byte_count)}{document.page_count ? ` · ${document.page_count} стр` : ''}</span>
-            {<span className={`document-state ${document.state_name}`}>{['queued', 'deleting'].includes(document.state_name) && <span className="status-dot"/>}{stateText[document.state_name]}</span>}
+            {document.state_name === 'indexing' ? <IndexingProgress document={document}/> : <span className={`document-state ${document.state_name}`}>{['queued', 'deleting'].includes(document.state_name) && <span className="status-dot"/>}{stateText[document.state_name]}</span>}
             {document.state_name === 'failed' && <><p className="document-failure">{documentFailureText(document.error_code, document.error_message)}</p><button className="text-button" disabled={documentAction !== null} onClick={() => void mutateDocument(document, 'retry')}><Icon name="retry" size={13}/>Повторить</button></>}
             {deleteConfirm === document.document_identifier && <div className="delete-confirm"><span>Удалить материал?</span><button className="danger-text" onClick={() => void mutateDocument(document, 'delete')}>Удалить</button><button className="text-button" onClick={() => setDeleteConfirm(null)}>Отмена</button></div>}
           </div><button className="icon-button document-delete" aria-label={`Удалить ${document.filename_text}`} disabled={documentAction !== null || document.state_name === 'deleting'} onClick={() => setDeleteConfirm(document.document_identifier)}><Icon name="trash" size={15}/></button>

@@ -29,6 +29,7 @@ def document_record(document_row: database.DocumentRow) -> entities.DocumentReco
         embedding_profile=document_row.embedding_profile,
         state_name=entities.DocumentState(document_row.state_name),
         chunk_count=document_row.chunk_count,
+        indexed_chunk_count=document_row.indexed_chunk_count,
         page_count=document_row.page_count,
         error_code=document_row.error_code,
         error_message=document_row.error_message,
