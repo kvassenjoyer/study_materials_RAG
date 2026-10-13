@@ -8,7 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from study_rag.adapters import database
 from study_rag.adapters.repositories import mapping
+from study_rag.adapters.repositories.projects import resolve_project
 from study_rag.domain import entities, errors
+
+
+maximum_chunk_page_size: typing.Final = 512
 
 
 @typing.final
@@ -22,10 +26,17 @@ class PostgreSQLDocumentRepository:
         tenant_identifier: uuid.UUID,
         document_registration: entities.DocumentRegistration,
     ) -> entities.DocumentRecord:
+        async with self._session_scope.transaction_session() as database_session:
+            project_row = await resolve_project(
+                database_session=database_session,
+                tenant_identifier=tenant_identifier,
+                project_identifier=document_registration.project_identifier,
+            )
         timestamp_value: typing.Final = datetime.datetime.now(datetime.UTC)
         document_row: typing.Final = database.DocumentRow(
             document_identifier=document_registration.document_identifier,
             tenant_identifier=tenant_identifier,
+            project_identifier=project_row.project_identifier,
             filename_text=document_registration.filename_text,
             media_type=document_registration.media_type,
             storage_key=document_registration.storage_key,
@@ -42,6 +53,11 @@ class PostgreSQLDocumentRepository:
         )
         try:
             async with self._session_scope.transaction_session() as database_session:
+                await resolve_project(
+                    database_session=database_session,
+                    tenant_identifier=tenant_identifier,
+                    project_identifier=document_row.project_identifier,
+                )
                 database_session.add(document_row)
                 await database_session.flush()
         except IntegrityError:
@@ -49,6 +65,7 @@ class PostgreSQLDocumentRepository:
                 existing_row: typing.Final = await database_session.scalar(
                     select(database.DocumentRow).where(
                         database.DocumentRow.tenant_identifier == tenant_identifier,
+                        database.DocumentRow.project_identifier == project_row.project_identifier,
                         database.DocumentRow.content_digest == document_registration.content_digest,
                         database.DocumentRow.embedding_profile == document_registration.embedding_profile,
                         database.DocumentRow.state_name != "deleted",
@@ -79,9 +96,17 @@ class PostgreSQLDocumentRepository:
         tenant_identifier: uuid.UUID,
         limit_count: int,
         offset_value: int,
+        project_identifier: uuid.UUID | None = None,
     ) -> entities.PageResult[entities.DocumentRecord]:
+        async with self._session_scope.transaction_session() as database_session:
+            project_row = await resolve_project(
+                database_session=database_session,
+                tenant_identifier=tenant_identifier,
+                project_identifier=project_identifier,
+            )
         owned_filter: typing.Final = and_(
             database.DocumentRow.tenant_identifier == tenant_identifier,
+            database.DocumentRow.project_identifier == project_row.project_identifier,
             database.DocumentRow.state_name != "deleted",
         )
         async with self._session_scope.reading_session() as database_session:
@@ -107,11 +132,13 @@ class PostgreSQLDocumentRepository:
         *,
         tenant_identifier: uuid.UUID,
         embedding_profile: str,
+        project_identifier: uuid.UUID,
     ) -> tuple[uuid.UUID, ...]:
         async with self._session_scope.reading_session() as database_session:
             document_identifiers: typing.Final = await database_session.scalars(
                 select(database.DocumentRow.document_identifier).where(
                     database.DocumentRow.tenant_identifier == tenant_identifier,
+                    database.DocumentRow.project_identifier == project_identifier,
                     database.DocumentRow.embedding_profile == embedding_profile,
                     database.DocumentRow.state_name == "ready",
                 ),
@@ -124,6 +151,7 @@ class PostgreSQLDocumentRepository:
         tenant_identifier: uuid.UUID,
         embedding_profile: str,
         chunk_identifiers: tuple[uuid.UUID, ...],
+        project_identifier: uuid.UUID,
     ) -> tuple[entities.ChunkRecord, ...]:
         if not chunk_identifiers:
             return ()
@@ -140,6 +168,7 @@ class PostgreSQLDocumentRepository:
                 .where(
                     database.ChunkRow.tenant_identifier == tenant_identifier,
                     database.DocumentRow.tenant_identifier == tenant_identifier,
+                    database.DocumentRow.project_identifier == project_identifier,
                     database.DocumentRow.embedding_profile == embedding_profile,
                     database.DocumentRow.state_name == "ready",
                     database.ChunkRow.chunk_identifier.in_(chunk_identifiers),
@@ -263,6 +292,7 @@ class PostgreSQLDocumentRepository:
             )
             if action_name == "index":
                 document_row.state_name = "indexing"
+                document_row.chunk_count = 0
             document_row.lease_identifier = uuid.uuid4()
             document_row.worker_identifier = worker_identifier
             document_row.lease_expires_at = timestamp_value + datetime.timedelta(seconds=lease_seconds)
@@ -317,6 +347,7 @@ class PostgreSQLDocumentRepository:
             database_session.add_all(mapping.chunk_database_row(one_chunk_record) for one_chunk_record in chunk_records)
             document_row.chunk_count = len(chunk_records)
             document_row.page_count = page_count
+            document_row.updated_at = datetime.datetime.now(datetime.UTC)
 
     async def complete_indexing(self, *, document_lease: entities.DocumentLease) -> None:
         if document_lease.action_name != "index":

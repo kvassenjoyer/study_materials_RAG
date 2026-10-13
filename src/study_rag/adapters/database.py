@@ -8,6 +8,7 @@ import uuid
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -28,7 +29,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from study_rag.domain.errors import DependencyUnavailableError
 
 
-_REQUIRED_SCHEMA_REVISION: typing.Final = "92c2c394c585"
+_REQUIRED_SCHEMA_REVISION: typing.Final = "c8f4b23e015a"
 
 
 @typing.final
@@ -61,9 +62,26 @@ class UserAccountRow(DatabaseBase):
     __tablename__ = "user_accounts"
 
     user_identifier: Mapped[uuid.UUID] = mapped_column(primary_key=True)
-    email_address: Mapped[str] = mapped_column(String(320), unique=True)
+    # Keep the original column so existing accounts and running installations retain their data.
+    login_name: Mapped[str] = mapped_column("email_address", String(320), unique=True)
     password_hash: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+
+
+@typing.final
+class ProjectRow(DatabaseBase):
+    __tablename__ = "projects"
+    __table_args__ = (
+        UniqueConstraint("project_identifier", "tenant_identifier"),
+        Index("ix_projects_tenant_created", "tenant_identifier", "created_at"),
+    )
+
+    project_identifier: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_identifier: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_accounts.user_identifier"))
+    title_text: Mapped[str] = mapped_column(String(200))
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
 
 
 @typing.final
@@ -71,13 +89,18 @@ class DocumentRow(DatabaseBase):
     __tablename__ = "documents"
     __table_args__ = (
         UniqueConstraint("document_identifier", "tenant_identifier"),
+        ForeignKeyConstraint(
+            ["project_identifier", "tenant_identifier"],
+            ["projects.project_identifier", "projects.tenant_identifier"],
+        ),
         CheckConstraint("state_name IN ('queued','indexing','ready','failed','deleting','deleted')", name="state_name"),
         CheckConstraint("chunk_count >= 0 AND byte_count >= 0 AND attempts >= 0", name="positive_counts"),
         Index("ix_documents_tenant_created", "tenant_identifier", "created_at"),
         Index("ix_documents_claim", "state_name", "next_attempt_at", "lease_expires_at"),
         Index(
-            "uq_documents_tenant_digest_profile_live",
+            "uq_documents_project_digest_profile_live",
             "tenant_identifier",
+            "project_identifier",
             "content_digest",
             "embedding_profile",
             unique=True,
@@ -87,6 +110,7 @@ class DocumentRow(DatabaseBase):
 
     document_identifier: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     tenant_identifier: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_accounts.user_identifier"))
+    project_identifier: Mapped[uuid.UUID]
     filename_text: Mapped[str] = mapped_column(Text)
     media_type: Mapped[str] = mapped_column(String(100))
     storage_key: Mapped[str] = mapped_column(Text)
@@ -135,12 +159,19 @@ class ChatSessionRow(DatabaseBase):
     __tablename__ = "chat_sessions"
     __table_args__ = (
         UniqueConstraint("chat_identifier", "tenant_identifier"),
+        ForeignKeyConstraint(
+            ["project_identifier", "tenant_identifier"],
+            ["projects.project_identifier", "projects.tenant_identifier"],
+        ),
         Index("ix_chats_tenant_created", "tenant_identifier", "created_at"),
     )
 
     chat_identifier: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     tenant_identifier: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_accounts.user_identifier"))
+    project_identifier: Mapped[uuid.UUID]
     title_text: Mapped[str] = mapped_column(String(200))
+    automatic_title: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
 

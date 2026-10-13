@@ -17,6 +17,7 @@ from study_rag.application.authentication import AuthenticationService
 from study_rag.application.conversations import ConversationService
 from study_rag.application.documents import DocumentService
 from study_rag.application.ingestion import IngestionWorker
+from study_rag.application.projects import ProjectService
 from study_rag.bootstrap import ApplicationResources
 from study_rag.config import Settings
 from study_rag.domain import entities, ports
@@ -24,11 +25,21 @@ from study_rag.main import create_application
 
 
 @pytest.fixture
-async def api_client() -> typing.AsyncIterator[httpx.AsyncClient]:
+def document_service() -> unittest.mock.Mock:
+    return unittest.mock.Mock(spec=DocumentService)
+
+
+@pytest.fixture
+async def api_client(document_service: unittest.mock.Mock) -> typing.AsyncIterator[httpx.AsyncClient]:
     authentication_service: typing.Final = unittest.mock.Mock(spec=AuthenticationService)
     authentication_service.authenticate_token.return_value = entities.TenantIdentity(
-        user_identifier=uuid.uuid4(), email_address="student@example.com"
+        user_identifier=uuid.uuid4(), login_name="student@example.com"
     )
+    authentication_service.register_account.return_value = entities.AuthToken(
+        access_token="fixture-access-token",  # noqa: S106 - Test-only token.
+        expires_in=3600,
+    )
+    authentication_service.login_account.return_value = authentication_service.register_account.return_value
     worker_event: typing.Final = asyncio.Event()
 
     async def wait_worker() -> None:
@@ -42,7 +53,8 @@ async def api_client() -> typing.AsyncIterator[httpx.AsyncClient]:
             maximum_upload_bytes=1024,
         ),
         authentication_service=authentication_service,
-        document_service=unittest.mock.Mock(spec=DocumentService),
+        project_service=unittest.mock.Mock(spec=ProjectService),
+        document_service=document_service,
         conversation_service=unittest.mock.Mock(spec=ConversationService),
         ingestion_worker=unittest.mock.Mock(spec=IngestionWorker),
         database_resources=unittest.mock.Mock(spec=DatabaseResources),
@@ -72,6 +84,25 @@ async def test_missing_bearer_returns_uniform_unauthorized(api_client: httpx.Asy
         "message_text": "A bearer token is required",
     }
     assert response_value.headers["www-authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize("endpoint", ["users", "sessions"])
+async def test_authentication_accepts_plain_login_at_http_boundary(
+    api_client: httpx.AsyncClient, endpoint: str
+) -> None:
+    response_value = await api_client.post(
+        f"/rest/study-rag/{endpoint}/",
+        json={"login_name": "student_123", "password_text": "fixture-password"},
+    )
+    assert response_value.status_code == (http.HTTPStatus.CREATED if endpoint == "users" else http.HTTPStatus.OK)
+    assert response_value.json()["access_token"] == "fixture-access-token"  # noqa: S105 - Test-only token.
+
+
+async def test_current_user_exposes_login_instead_of_email(api_client: httpx.AsyncClient) -> None:
+    response_value = await api_client.get("/rest/study-rag/users/current/", headers={"Authorization": "Bearer fixture"})
+    assert response_value.status_code == http.HTTPStatus.OK
+    assert response_value.json()["login_name"] == "student@example.com"
+    assert "email_address" not in response_value.json()
 
 
 async def test_client_cannot_supply_tenant_in_question(api_client: httpx.AsyncClient) -> None:

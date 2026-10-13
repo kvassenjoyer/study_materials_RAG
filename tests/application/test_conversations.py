@@ -54,6 +54,7 @@ def scenario_context() -> ScenarioContext:
         assistant_message=None,
     )
     document_record: typing.Final = entities.DocumentRecord(
+        project_identifier=uuid.uuid4(),
         document_identifier=document_identifier,
         tenant_identifier=tenant_identifier,
         filename_text="lecture.md",
@@ -86,6 +87,14 @@ def scenario_context() -> ScenarioContext:
     conversation_repository: typing.Final = unittest.mock.AsyncMock(spec=ports.ConversationRepository)
     conversation_repository.begin_turn.return_value = turn_record
     conversation_repository.fetch_history.return_value = ()
+    conversation_repository.fetch_chat.return_value = entities.ChatRecord(
+        chat_identifier=chat_identifier,
+        tenant_identifier=tenant_identifier,
+        project_identifier=document_record.project_identifier,
+        title_text="Fixture",
+        created_at=recorded_timestamp,
+        updated_at=recorded_timestamp,
+    )
 
     async def complete_saved_turn(
         *,
@@ -133,7 +142,7 @@ def scenario_context() -> ScenarioContext:
         citation_identifiers=(chunk_records[2].chunk_identifier,),
     )
     return ScenarioContext(
-        tenant_identity=entities.TenantIdentity(user_identifier=tenant_identifier, email_address="student@example.com"),
+        tenant_identity=entities.TenantIdentity(user_identifier=tenant_identifier, login_name="student@example.com"),
         turn_record=turn_record,
         chunk_records=chunk_records,
         conversation_repository=conversation_repository,

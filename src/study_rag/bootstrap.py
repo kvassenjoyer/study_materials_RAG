@@ -18,6 +18,7 @@ from study_rag.adapters.repositories import (
     PostgreSQLConversationRepository,
     PostgreSQLDocumentRepository,
 )
+from study_rag.adapters.repositories.projects import PostgreSQLProjectRepository
 from study_rag.adapters.security import ArgonPasswordSecurity, JwtAccessTokenCodec
 from study_rag.adapters.tokenizer import HuggingFaceTokenizer
 from study_rag.adapters.vector_store import QdrantVectorStore
@@ -25,6 +26,7 @@ from study_rag.application.authentication import AuthenticationService
 from study_rag.application.conversations import ConversationService
 from study_rag.application.documents import DocumentService
 from study_rag.application.ingestion import IngestionWorker
+from study_rag.application.projects import ProjectService
 from study_rag.config import Settings
 from study_rag.domain import ports
 
@@ -34,6 +36,7 @@ from study_rag.domain import ports
 class ApplicationResources:
     settings: Settings
     authentication_service: AuthenticationService
+    project_service: ProjectService
     document_service: DocumentService
     conversation_service: ConversationService
     ingestion_worker: IngestionWorker
@@ -198,6 +201,9 @@ async def initialize_resources(*, settings: Settings | None = None) -> typing.As
         application_resources: typing.Final = ApplicationResources(
             settings=configured_settings,
             authentication_service=authentication_service,
+            project_service=ProjectService(
+                project_repository=PostgreSQLProjectRepository(session_factory=database_resources.session_factory)
+            ),
             document_service=document_service,
             conversation_service=conversation_service,
             ingestion_worker=ingestion_worker,

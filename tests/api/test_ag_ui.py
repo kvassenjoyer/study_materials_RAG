@@ -38,7 +38,7 @@ class AgentApiScenario:
 @pytest.fixture
 async def agent_scenario() -> typing.AsyncIterator[AgentApiScenario]:
     tenant_identity: typing.Final = entities.TenantIdentity(
-        user_identifier=uuid.uuid4(), email_address="student@example.com"
+        user_identifier=uuid.uuid4(), login_name="student@example.com"
     )
     chat_identifier: typing.Final = uuid.uuid4()
     turn_identifier: typing.Final = uuid.uuid4()

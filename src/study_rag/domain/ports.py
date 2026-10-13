@@ -7,11 +7,29 @@ from study_rag.domain import entities
 
 
 class AuthRepository(typing.Protocol):
-    async def create_account(self, *, email_address: str, password_hash: str) -> entities.UserAccount: ...
+    async def create_account(self, *, login_name: str, password_hash: str) -> entities.UserAccount: ...
 
-    async def fetch_by_email(self, *, email_address: str) -> entities.UserAccount | None: ...
+    async def fetch_by_login(self, *, login_name: str) -> entities.UserAccount | None: ...
 
     async def fetch_by_identifier(self, *, user_identifier: uuid.UUID) -> entities.UserAccount | None: ...
+
+
+class ProjectRepository(typing.Protocol):
+    async def rename_project(
+        self, *, tenant_identifier: uuid.UUID, project_identifier: uuid.UUID, title_text: str
+    ) -> entities.ProjectRecord: ...
+
+    async def delete_project(self, *, tenant_identifier: uuid.UUID, project_identifier: uuid.UUID) -> None: ...
+
+    async def create_project(self, *, tenant_identifier: uuid.UUID, title_text: str) -> entities.ProjectRecord: ...
+
+    async def fetch_project(
+        self, *, tenant_identifier: uuid.UUID, project_identifier: uuid.UUID
+    ) -> entities.ProjectRecord: ...
+
+    async def list_projects(
+        self, *, tenant_identifier: uuid.UUID, limit_count: int, offset_value: int
+    ) -> entities.PageResult[entities.ProjectRecord]: ...
 
 
 class DocumentRepository(typing.Protocol):
@@ -24,11 +42,16 @@ class DocumentRepository(typing.Protocol):
     ) -> entities.DocumentRecord: ...
 
     async def list_documents(
-        self, *, tenant_identifier: uuid.UUID, limit_count: int, offset_value: int
+        self,
+        *,
+        tenant_identifier: uuid.UUID,
+        limit_count: int,
+        offset_value: int,
+        project_identifier: uuid.UUID | None = None,
     ) -> entities.PageResult[entities.DocumentRecord]: ...
 
     async def fetch_ready_identifiers(
-        self, *, tenant_identifier: uuid.UUID, embedding_profile: str
+        self, *, tenant_identifier: uuid.UUID, embedding_profile: str, project_identifier: uuid.UUID
     ) -> tuple[uuid.UUID, ...]: ...
 
     async def fetch_ready_chunks(
@@ -37,6 +60,7 @@ class DocumentRepository(typing.Protocol):
         tenant_identifier: uuid.UUID,
         embedding_profile: str,
         chunk_identifiers: tuple[uuid.UUID, ...],
+        project_identifier: uuid.UUID,
     ) -> tuple[entities.ChunkRecord, ...]: ...
 
     async def fetch_chunk(
@@ -79,12 +103,29 @@ class DocumentRepository(typing.Protocol):
 
 
 class ConversationRepository(typing.Protocol):
-    async def create_chat(self, *, tenant_identifier: uuid.UUID, title_text: str) -> entities.ChatRecord: ...
+    async def rename_chat(
+        self, *, tenant_identifier: uuid.UUID, chat_identifier: uuid.UUID, title_text: str
+    ) -> entities.ChatRecord: ...
+
+    async def delete_chat(self, *, tenant_identifier: uuid.UUID, chat_identifier: uuid.UUID) -> None: ...
+
+    async def create_chat(
+        self,
+        *,
+        tenant_identifier: uuid.UUID,
+        title_text: str | None = None,
+        project_identifier: uuid.UUID | None = None,
+    ) -> entities.ChatRecord: ...
 
     async def fetch_chat(self, *, tenant_identifier: uuid.UUID, chat_identifier: uuid.UUID) -> entities.ChatRecord: ...
 
     async def list_chats(
-        self, *, tenant_identifier: uuid.UUID, limit_count: int, offset_value: int
+        self,
+        *,
+        tenant_identifier: uuid.UUID,
+        limit_count: int,
+        offset_value: int,
+        project_identifier: uuid.UUID | None = None,
     ) -> entities.PageResult[entities.ChatRecord]: ...
 
     async def list_messages(

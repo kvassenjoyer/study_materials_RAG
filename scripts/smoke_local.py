@@ -101,7 +101,7 @@ class LocalSmokeRunner:
                 chat_identifier=(await self._create_chat(access_token=primary_token)).chat_identifier,
                 question_text="What is the exact secret access code to the Zarnox lunar vault?",
             )
-            self._expect_refusal(answer_record=missing_answer)
+            self._expect_without_sources(answer_record=missing_answer)
             for document_identifier in (first_document.document_identifier, second_document.document_identifier):
                 await self._delete_material(access_token=primary_token, document_identifier=document_identifier)
             deleted_answer: typing.Final = await self._ask_question(
@@ -109,10 +109,10 @@ class LocalSmokeRunner:
                 chat_identifier=primary_chat.chat_identifier,
                 question_text="Что такое градиентный спуск?",
             )
-            self._expect_refusal(answer_record=deleted_answer)
+            self._expect_without_sources(answer_record=deleted_answer)
             print(  # noqa: T201 -- The verification CLI reports its outcome.
                 "PASS: real RU/EN retrieval, citations, chat history, replay, "
-                "two-tenant isolation, refusal and deletion"
+                "two-tenant isolation, general answers without sources and deletion"
             )
         finally:
             for access_token, document_identifier in self.created_documents:
@@ -121,7 +121,7 @@ class LocalSmokeRunner:
     async def _register_account(self) -> str:
         response_value: typing.Final = await self.http_client.post(
             "/rest/study-rag/users/",
-            json={"email_address": f"smoke-{uuid.uuid4().hex}@example.com", "password_text": secrets.token_urlsafe(24)},
+            json={"login_name": f"smoke-{uuid.uuid4().hex}", "password_text": secrets.token_urlsafe(24)},
         )
         response_value.raise_for_status()
         return schemas.AuthResponse.model_validate(response_value.json()).access_token
@@ -209,7 +209,7 @@ class LocalSmokeRunner:
             chat_identifier=foreign_chat.chat_identifier,
             question_text="Что такое градиентный спуск?",
         )
-        self._expect_refusal(answer_record=foreign_answer)
+        self._expect_without_sources(answer_record=foreign_answer)
 
     async def _delete_material(self, *, access_token: str, document_identifier: uuid.UUID) -> None:
         response_value: typing.Final = await self.http_client.delete(
@@ -230,7 +230,7 @@ class LocalSmokeRunner:
                 message_text="Citation label does not map to the answer",
             )
 
-    def _expect_refusal(self, *, answer_record: schemas.AnswerResponse) -> None:
+    def _expect_without_sources(self, *, answer_record: schemas.AnswerResponse) -> None:
         self._expect_condition(
             condition_value=answer_record.assistant_message.sufficient_context is False
             and not answer_record.assistant_message.citation_records,

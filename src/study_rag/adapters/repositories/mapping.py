@@ -10,7 +10,7 @@ from study_rag.domain import entities
 def account_record(account_row: database.UserAccountRow) -> entities.UserAccount:
     return entities.UserAccount(
         user_identifier=account_row.user_identifier,
-        email_address=account_row.email_address,
+        login_name=account_row.login_name,
         password_hash=account_row.password_hash,
         created_at=account_row.created_at,
     )
@@ -20,6 +20,7 @@ def document_record(document_row: database.DocumentRow) -> entities.DocumentReco
     return entities.DocumentRecord(
         document_identifier=document_row.document_identifier,
         tenant_identifier=document_row.tenant_identifier,
+        project_identifier=document_row.project_identifier,
         filename_text=document_row.filename_text,
         media_type=document_row.media_type,
         storage_key=document_row.storage_key,
@@ -66,6 +67,7 @@ def chat_record(session_row: database.ChatSessionRow) -> entities.ChatRecord:
     return entities.ChatRecord(
         chat_identifier=session_row.chat_identifier,
         tenant_identifier=session_row.tenant_identifier,
+        project_identifier=session_row.project_identifier,
         title_text=session_row.title_text,
         created_at=session_row.created_at,
         updated_at=session_row.updated_at,

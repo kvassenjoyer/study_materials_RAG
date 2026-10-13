@@ -1,14 +1,16 @@
 export interface AuthToken { access_token: string; expires_in: number; token_type: string }
-export interface Identity { user_identifier: string; email_address: string }
+export interface Identity { user_identifier: string; login_name: string }
 export interface Page<T> { items: T[]; total_count: number; offset: number; limit: number }
 export type DocumentState = 'queued' | 'indexing' | 'ready' | 'failed' | 'deleting' | 'deleted';
 export interface DocumentRecord {
+  project_identifier: string;
   document_identifier: string; filename_text: string; media_type: string; byte_count: number;
   state_name: DocumentState; chunk_count: number; page_count: number | null;
   embedding_profile: string; error_code: string | null; error_message: string | null;
   created_at: string; updated_at: string;
 }
-export interface ChatRecord { chat_identifier: string; title_text: string; created_at: string; updated_at: string }
+export interface ChatRecord { chat_identifier: string; project_identifier: string; title_text: string; created_at: string; updated_at: string }
+export interface ProjectRecord { project_identifier: string; title_text: string; created_at: string; updated_at: string }
 export interface Citation {
   source_label: string; chunk_identifier: string; document_identifier: string; filename_text: string;
   page_start: number | null; page_end: number | null; excerpt_text: string;

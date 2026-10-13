@@ -12,6 +12,7 @@ from study_rag.domain import entities, errors, ports
 application_logger: typing.Final = logging.getLogger(__name__)
 maximum_question_characters: typing.Final = 4000
 maximum_excerpt_characters: typing.Final = 1000
+maximum_chat_title_characters: typing.Final = 200
 
 
 @typing.final
@@ -29,9 +30,17 @@ class ConversationService:
     turn_lease_seconds: int = 300
     answer_timeout_seconds: float = 240.0
 
-    async def create_chat(self, *, tenant_identity: entities.TenantIdentity, title_text: str) -> entities.ChatRecord:
+    async def create_chat(
+        self,
+        *,
+        tenant_identity: entities.TenantIdentity,
+        title_text: str | None = None,
+        project_identifier: uuid.UUID | None = None,
+    ) -> entities.ChatRecord:
         return await self.conversation_repository.create_chat(
-            tenant_identifier=tenant_identity.user_identifier, title_text=title_text.strip()
+            tenant_identifier=tenant_identity.user_identifier,
+            title_text=self._validated_title(title_text=title_text) if title_text is not None else None,
+            project_identifier=project_identifier,
         )
 
     async def fetch_chat(
@@ -42,10 +51,18 @@ class ConversationService:
         )
 
     async def list_chats(
-        self, *, tenant_identity: entities.TenantIdentity, limit_count: int, offset_value: int
+        self,
+        *,
+        tenant_identity: entities.TenantIdentity,
+        limit_count: int,
+        offset_value: int,
+        project_identifier: uuid.UUID | None = None,
     ) -> entities.PageResult[entities.ChatRecord]:
         return await self.conversation_repository.list_chats(
-            tenant_identifier=tenant_identity.user_identifier, limit_count=limit_count, offset_value=offset_value
+            tenant_identifier=tenant_identity.user_identifier,
+            limit_count=limit_count,
+            offset_value=offset_value,
+            project_identifier=project_identifier,
         )
 
     async def list_messages(
@@ -136,7 +153,10 @@ class ConversationService:
             message_limit=self.history_message_limit,
         )
         context_chunks: typing.Final = await self._retrieve_context(
-            tenant_identity=tenant_identity, question_text=question_text, conversation_history=conversation_history
+            tenant_identity=tenant_identity,
+            chat_identifier=turn_record.chat_identifier,
+            question_text=question_text,
+            conversation_history=conversation_history,
         )
         generated_answer = self._insufficient_answer(question_text=question_text)
         citation_records: tuple[entities.CitationRecord, ...] = ()
@@ -159,12 +179,18 @@ class ConversationService:
         self,
         *,
         tenant_identity: entities.TenantIdentity,
+        chat_identifier: uuid.UUID,
         question_text: str,
         conversation_history: tuple[entities.MessageRecord, ...],
     ) -> tuple[entities.RetrievedChunk, ...]:
+        chat_record = await self.conversation_repository.fetch_chat(
+            tenant_identifier=tenant_identity.user_identifier,
+            chat_identifier=chat_identifier,
+        )
         document_identifiers: typing.Final = await self.document_repository.fetch_ready_identifiers(
             tenant_identifier=tenant_identity.user_identifier,
             embedding_profile=self.embedding_provider.embedding_profile,
+            project_identifier=chat_record.project_identifier,
         )
         if not document_identifiers:
             return ()
@@ -189,6 +215,7 @@ class ConversationService:
         chunk_records: typing.Final = await self.document_repository.fetch_ready_chunks(
             tenant_identifier=tenant_identity.user_identifier,
             embedding_profile=self.embedding_provider.embedding_profile,
+            project_identifier=chat_record.project_identifier,
             chunk_identifiers=tuple(vector_match.chunk_identifier for vector_match in accepted_matches),
         )
         available_chunks: typing.Final = {chunk_record.chunk_identifier: chunk_record for chunk_record in chunk_records}
@@ -278,3 +305,25 @@ class ConversationService:
             application_logger.exception(
                 "Could not fail turn %s; lease recovery remains available", turn_record.turn_identifier
             )
+
+    async def rename_chat(
+        self, *, tenant_identity: entities.TenantIdentity, chat_identifier: uuid.UUID, title_text: str
+    ) -> entities.ChatRecord:
+        return await self.conversation_repository.rename_chat(
+            tenant_identifier=tenant_identity.user_identifier,
+            chat_identifier=chat_identifier,
+            title_text=self._validated_title(title_text=title_text),
+        )
+
+    async def delete_chat(self, *, tenant_identity: entities.TenantIdentity, chat_identifier: uuid.UUID) -> None:
+        await self.conversation_repository.delete_chat(
+            tenant_identifier=tenant_identity.user_identifier, chat_identifier=chat_identifier
+        )
+
+    def _validated_title(self, *, title_text: str) -> str:
+        normalized_title = title_text.strip()
+        if not normalized_title or len(normalized_title) > maximum_chat_title_characters:
+            raise errors.InvalidInputError(
+                error_code="invalid_chat_title", message_text="Chat title must contain 1 to 200 characters"
+            )
+        return normalized_title

@@ -14,7 +14,7 @@ import uuid
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Connection, inspect, text, update
+from sqlalchemy import Connection, column, func, insert, inspect, select, table, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from study_rag.adapters import database
@@ -23,11 +23,13 @@ from study_rag.adapters.repositories import (
     PostgreSQLConversationRepository,
     PostgreSQLDocumentRepository,
 )
+from study_rag.adapters.repositories.projects import PostgreSQLProjectRepository
 from study_rag.domain import entities, errors
 
 
 pytestmark = pytest.mark.integration
 _MESSAGE_PAIR_SIZE = 2
+_FIXTURE_RESPONSE_DURATION_MS = 1200
 
 
 @typing.final
@@ -38,6 +40,15 @@ class RepositoryHarness:
     auth_repository: PostgreSQLAuthRepository
     document_repository: PostgreSQLDocumentRepository
     conversation_repository: PostgreSQLConversationRepository
+
+
+@typing.final
+class ChunkScanArguments(typing.TypedDict):
+    tenant_identifier: uuid.UUID
+    project_identifier: uuid.UUID
+    embedding_profile: str
+    limit_count: int
+    offset_value: int
 
 
 @pytest.fixture
@@ -78,7 +89,7 @@ def apply_test_migration(connection: Connection, target_revision: str = "head") 
 
 async def create_test_account(repository_harness: RepositoryHarness) -> entities.UserAccount:
     return await repository_harness.auth_repository.create_account(
-        email_address=f"{uuid.uuid4()}@example.test", password_hash="fixture-hash"
+        login_name=f"{uuid.uuid4()}@example.test", password_hash="fixture-hash"
     )
 
 
@@ -140,6 +151,7 @@ async def test_initial_migration_creates_all_tables(repository_harness: Reposito
     assert set(table_names) == {
         "alembic_version",
         "user_accounts",
+        "projects",
         "documents",
         "document_chunks",
         "chat_sessions",
@@ -148,22 +160,298 @@ async def test_initial_migration_creates_all_tables(repository_harness: Reposito
     }
 
 
+async def test_automatic_chat_title_is_set_once_and_manual_name_wins(repository_harness: RepositoryHarness) -> None:
+    account_record = await create_test_account(repository_harness)
+    repository = repository_harness.conversation_repository
+    chat_record = await repository.create_chat(tenant_identifier=account_record.user_identifier)
+    first_request = uuid.uuid4()
+    first_turn = await repository.begin_turn(
+        tenant_identifier=account_record.user_identifier,
+        chat_identifier=chat_record.chat_identifier,
+        client_request_identifier=first_request,
+        question_text="  Объясни\nградиентный спуск  ",  # noqa: RUF001 - Russian whitespace fixture
+        lease_seconds=120,
+    )
+    titled_chat = await repository.fetch_chat(
+        tenant_identifier=account_record.user_identifier, chat_identifier=chat_record.chat_identifier
+    )
+    assert titled_chat.title_text == "Объясни градиентный спуск"
+    await repository.fail_turn(
+        tenant_identifier=account_record.user_identifier, turn_record=first_turn, error_code="fixture_error"
+    )
+    await repository.rename_chat(
+        tenant_identifier=account_record.user_identifier,
+        chat_identifier=chat_record.chat_identifier,
+        title_text="Оптимизация",
+    )
+    await repository.begin_turn(
+        tenant_identifier=account_record.user_identifier,
+        chat_identifier=chat_record.chat_identifier,
+        client_request_identifier=first_request,
+        question_text="  Объясни\nградиентный спуск  ",  # noqa: RUF001 - Russian whitespace fixture
+        lease_seconds=120,
+    )
+    assert (
+        await repository.fetch_chat(
+            tenant_identifier=account_record.user_identifier, chat_identifier=chat_record.chat_identifier
+        )
+    ).title_text == "Оптимизация"
+    manual_chat = await repository.create_chat(
+        tenant_identifier=account_record.user_identifier, title_text="Мой семинар"
+    )
+    await repository.begin_turn(
+        tenant_identifier=account_record.user_identifier,
+        chat_identifier=manual_chat.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="Другой вопрос",
+        lease_seconds=120,
+    )
+    assert (
+        await repository.fetch_chat(
+            tenant_identifier=account_record.user_identifier, chat_identifier=manual_chat.chat_identifier
+        )
+    ).title_text == "Мой семинар"
+
+
+async def test_chat_deletion_removes_history_and_prevents_late_completion(
+    repository_harness: RepositoryHarness,
+) -> None:
+    document_record = await registered_fixture(repository_harness)
+    repository = repository_harness.conversation_repository
+    chat_record = await repository.create_chat(tenant_identifier=document_record.tenant_identifier)
+    pending_turn = await repository.begin_turn(
+        tenant_identifier=document_record.tenant_identifier,
+        chat_identifier=chat_record.chat_identifier,
+        client_request_identifier=uuid.uuid4(),
+        question_text="Привет",
+        lease_seconds=120,
+    )
+    await repository.delete_chat(
+        tenant_identifier=document_record.tenant_identifier, chat_identifier=chat_record.chat_identifier
+    )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository.complete_turn(
+            tenant_identifier=document_record.tenant_identifier,
+            turn_record=pending_turn,
+            generated_answer=entities.GeneratedAnswer(
+                answer_text="Late answer", sufficient_context=False, citation_identifiers=()
+            ),
+            citation_records=(),
+        )
+    await repository.fail_turn(
+        tenant_identifier=document_record.tenant_identifier, turn_record=pending_turn, error_code="late_failure"
+    )
+    assert (
+        await repository.list_chats(
+            tenant_identifier=document_record.tenant_identifier, limit_count=100, offset_value=0
+        )
+    ).total_count == 0
+    async with repository_harness.session_factory() as database_session:
+        assert await database_session.scalar(select(func.count()).select_from(database.ChatMessageRow)) == 0
+        assert await database_session.scalar(select(func.count()).select_from(database.ChatTurnRow)) == 0
+    assert (
+        await repository_harness.document_repository.fetch_document(
+            tenant_identifier=document_record.tenant_identifier, document_identifier=document_record.document_identifier
+        )
+        == document_record
+    )
+
+
+async def test_project_deletion_revokes_index_lease_and_does_not_reappear(
+    repository_harness: RepositoryHarness,
+) -> None:
+    document_record = await registered_fixture(repository_harness)
+    old_lease = await claim_fixture(repository_harness)
+    project_repository = PostgreSQLProjectRepository(session_factory=repository_harness.session_factory)
+    renamed_project = await project_repository.rename_project(
+        tenant_identifier=document_record.tenant_identifier,
+        project_identifier=document_record.project_identifier,
+        title_text="Лекции",
+    )
+    assert renamed_project.title_text == "Лекции"
+    chat_record = await repository_harness.conversation_repository.create_chat(
+        tenant_identifier=document_record.tenant_identifier,
+        project_identifier=document_record.project_identifier,
+    )
+    await project_repository.delete_project(
+        tenant_identifier=document_record.tenant_identifier,
+        project_identifier=document_record.project_identifier,
+    )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository_harness.conversation_repository.fetch_chat(
+            tenant_identifier=document_record.tenant_identifier,
+            chat_identifier=chat_record.chat_identifier,
+        )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository_harness.document_repository.register_document(
+            tenant_identifier=document_record.tenant_identifier,
+            document_registration=dataclasses.replace(
+                document_registration(content_digest="b" * 64), project_identifier=document_record.project_identifier
+            ),
+        )
+    with pytest.raises(errors.LeaseLostError):
+        await repository_harness.document_repository.complete_indexing(document_lease=old_lease)
+    assert (
+        await project_repository.list_projects(
+            tenant_identifier=document_record.tenant_identifier, limit_count=100, offset_value=0
+        )
+    ).total_count == 0
+    deletion_lease = await claim_fixture(repository_harness)
+    assert deletion_lease.action_name == "delete"
+    await repository_harness.document_repository.complete_deletion(document_lease=deletion_lease)
+    replacement = await project_repository.create_project(
+        tenant_identifier=document_record.tenant_identifier, title_text="Новый курс"
+    )
+    default_chat = await repository_harness.conversation_repository.create_chat(
+        tenant_identifier=document_record.tenant_identifier
+    )
+    assert default_chat.project_identifier == replacement.project_identifier
+
+
+async def test_management_rejects_foreign_resources(repository_harness: RepositoryHarness) -> None:
+    owner_account = await create_test_account(repository_harness)
+    stranger = await create_test_account(repository_harness)
+    repository = repository_harness.conversation_repository
+    chat_record = await repository.create_chat(tenant_identifier=owner_account.user_identifier)
+    project_repository = PostgreSQLProjectRepository(session_factory=repository_harness.session_factory)
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository.rename_chat(
+            tenant_identifier=stranger.user_identifier,
+            chat_identifier=chat_record.chat_identifier,
+            title_text="Чужой чат",
+        )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await repository.delete_chat(
+            tenant_identifier=stranger.user_identifier, chat_identifier=chat_record.chat_identifier
+        )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await project_repository.rename_project(
+            tenant_identifier=stranger.user_identifier,
+            project_identifier=chat_record.project_identifier,
+            title_text="Чужой проект",
+        )
+    with pytest.raises(errors.ResourceNotFoundError):
+        await project_repository.delete_project(
+            tenant_identifier=stranger.user_identifier, project_identifier=chat_record.project_identifier
+        )
+    assert (
+        await repository.fetch_chat(
+            tenant_identifier=owner_account.user_identifier, chat_identifier=chat_record.chat_identifier
+        )
+        == chat_record
+    )
+
+
+async def test_project_deletion_keeps_other_project_history_and_files(repository_harness: RepositoryHarness) -> None:
+    document_record = await registered_fixture(repository_harness)
+    project_repository = PostgreSQLProjectRepository(session_factory=repository_harness.session_factory)
+    other_project = await project_repository.create_project(
+        tenant_identifier=document_record.tenant_identifier, title_text="Другой курс"
+    )
+    other_document = await repository_harness.document_repository.register_document(
+        tenant_identifier=document_record.tenant_identifier,
+        document_registration=dataclasses.replace(
+            document_registration(), project_identifier=other_project.project_identifier
+        ),
+    )
+    repository = repository_harness.conversation_repository
+    for project_identifier in (document_record.project_identifier, other_project.project_identifier):
+        chat_record = await repository.create_chat(
+            tenant_identifier=document_record.tenant_identifier, project_identifier=project_identifier
+        )
+        await repository.begin_turn(
+            tenant_identifier=document_record.tenant_identifier,
+            chat_identifier=chat_record.chat_identifier,
+            client_request_identifier=uuid.uuid4(),
+            question_text="Вопрос",
+            lease_seconds=120,
+        )
+    await project_repository.delete_project(
+        tenant_identifier=document_record.tenant_identifier, project_identifier=document_record.project_identifier
+    )
+    async with repository_harness.session_factory() as database_session:
+        assert await database_session.scalar(select(func.count()).select_from(database.ChatMessageRow)) == 1
+        assert await database_session.scalar(select(func.count()).select_from(database.ChatTurnRow)) == 1
+    assert (
+        await repository_harness.document_repository.fetch_document(
+            tenant_identifier=document_record.tenant_identifier, document_identifier=other_document.document_identifier
+        )
+        == other_document
+    )
+    assert (
+        await repository.list_chats(
+            tenant_identifier=document_record.tenant_identifier,
+            project_identifier=other_project.project_identifier,
+            limit_count=100,
+            offset_value=0,
+        )
+    ).total_count == 1
+
+
 async def test_account_duplicate_and_lookup(repository_harness: RepositoryHarness) -> None:
     user_account = await create_test_account(repository_harness)
 
     with pytest.raises(errors.ResourceConflictError, match="already registered"):
         await repository_harness.auth_repository.create_account(
-            email_address=user_account.email_address, password_hash="other-hash"
+            login_name=user_account.login_name, password_hash="other-hash"
         )
 
     assert (
         await repository_harness.auth_repository.fetch_by_identifier(user_identifier=user_account.user_identifier)
         == user_account
     )
-    assert (
-        await repository_harness.auth_repository.fetch_by_email(email_address=user_account.email_address)
-        == user_account
+    assert await repository_harness.auth_repository.fetch_by_login(login_name=user_account.login_name) == user_account
+
+
+async def test_login_accounts_reuse_legacy_column_and_preserve_existing_identifiers(
+    repository_harness: RepositoryHarness,
+) -> None:
+    legacy_identifier = uuid.uuid4()
+    async with repository_harness.session_factory.begin() as database_session:
+        await database_session.execute(
+            insert(
+                table(
+                    "user_accounts",
+                    column("user_identifier"),
+                    column("email_address"),
+                    column("password_hash"),
+                    column("created_at"),
+                )
+            ).values(
+                user_identifier=legacy_identifier,
+                email_address="legacy@example.test",
+                password_hash="legacy-hash",
+                created_at=datetime.datetime.now(datetime.UTC),
+            )
+        )
+    repository = repository_harness.auth_repository
+    legacy_account = await repository.fetch_by_login(login_name="legacy@example.test")
+    assert legacy_account is not None
+    assert legacy_account.user_identifier == legacy_identifier
+    assert legacy_account.login_name == "legacy@example.test"
+    assert legacy_account.password_hash == "legacy-hash"  # noqa: S105 - Test-only hash.
+    new_account = await repository.create_account(login_name="student_123", password_hash="new-hash")
+    assert await repository.fetch_by_login(login_name="student_123") == new_account
+    with pytest.raises(errors.ResourceConflictError) as raised_error:
+        await repository.create_account(login_name="student_123", password_hash="another-hash")
+    assert raised_error.value.error_code == "login_already_registered"
+
+
+async def test_default_project_creation_is_idempotent_under_concurrent_requests(
+    repository_harness: RepositoryHarness,
+) -> None:
+    user_account = await create_test_account(repository_harness)
+    project_repository = PostgreSQLProjectRepository(session_factory=repository_harness.session_factory)
+    first_page, second_page = await asyncio.gather(
+        *(
+            project_repository.list_projects(
+                tenant_identifier=user_account.user_identifier, limit_count=50, offset_value=0
+            )
+            for _request_index in range(2)
+        )
     )
+    assert first_page.items == second_page.items
+    assert len(first_page.items) == 1
 
 
 async def test_document_dedup_race_is_tenant_scoped(repository_harness: RepositoryHarness) -> None:
@@ -186,7 +474,8 @@ async def test_document_dedup_race_is_tenant_scoped(repository_harness: Reposito
     assert second_document.document_identifier != first_document.document_identifier
     with pytest.raises(errors.ResourceNotFoundError):
         await repository_harness.document_repository.fetch_document(
-            tenant_identifier=second_account.user_identifier, document_identifier=first_document.document_identifier
+            tenant_identifier=second_account.user_identifier,
+            document_identifier=first_document.document_identifier,
         )
     assert (
         await repository_harness.document_repository.list_documents(
@@ -207,12 +496,15 @@ async def test_partial_index_not_visible_and_ready_chunks_are_tenant_scoped(
 
     assert (
         await repository_harness.document_repository.fetch_ready_identifiers(
-            tenant_identifier=document_record.tenant_identifier, embedding_profile=document_record.embedding_profile
+            project_identifier=document_record.project_identifier,
+            tenant_identifier=document_record.tenant_identifier,
+            embedding_profile=document_record.embedding_profile,
         )
         == ()
     )
     assert (
         await repository_harness.document_repository.fetch_ready_chunks(
+            project_identifier=document_record.project_identifier,
             tenant_identifier=document_record.tenant_identifier,
             embedding_profile=document_record.embedding_profile,
             chunk_identifiers=(stored_chunk.chunk_identifier,),
@@ -225,12 +517,14 @@ async def test_partial_index_not_visible_and_ready_chunks_are_tenant_scoped(
         )
     await repository_harness.document_repository.complete_indexing(document_lease=document_lease)
     assert await repository_harness.document_repository.fetch_ready_chunks(
+        project_identifier=document_record.project_identifier,
         tenant_identifier=document_record.tenant_identifier,
         embedding_profile=document_record.embedding_profile,
         chunk_identifiers=(stored_chunk.chunk_identifier,),
     ) == (stored_chunk,)
     assert (
         await repository_harness.document_repository.fetch_ready_chunks(
+            project_identifier=document_record.project_identifier,
             tenant_identifier=uuid.uuid4(),
             embedding_profile=document_record.embedding_profile,
             chunk_identifiers=(stored_chunk.chunk_identifier,),
@@ -239,6 +533,7 @@ async def test_partial_index_not_visible_and_ready_chunks_are_tenant_scoped(
     )
     assert (
         await repository_harness.document_repository.fetch_ready_chunks(
+            project_identifier=document_record.project_identifier,
             tenant_identifier=document_record.tenant_identifier,
             embedding_profile="another-profile",
             chunk_identifiers=(stored_chunk.chunk_identifier,),
@@ -308,7 +603,9 @@ async def test_tombstone_revokes_lease_and_cleanup_backoff_is_durable(repository
     assert deleting_record.state_name is entities.DocumentState.DELETING
     assert (
         await repository_harness.document_repository.fetch_ready_identifiers(
-            tenant_identifier=document_record.tenant_identifier, embedding_profile=document_record.embedding_profile
+            project_identifier=document_record.project_identifier,
+            tenant_identifier=document_record.tenant_identifier,
+            embedding_profile=document_record.embedding_profile,
         )
         == ()
     )
@@ -365,7 +662,9 @@ async def test_failed_index_retry_preserves_no_false_ready(repository_harness: R
     assert retried_document.error_code is None
     assert (
         await repository_harness.document_repository.fetch_ready_identifiers(
-            tenant_identifier=document_record.tenant_identifier, embedding_profile=document_record.embedding_profile
+            project_identifier=document_record.project_identifier,
+            tenant_identifier=document_record.tenant_identifier,
+            embedding_profile=document_record.embedding_profile,
         )
         == ()
     )
@@ -592,7 +891,9 @@ async def test_active_indexing_tombstone_rejects_late_completion(repository_harn
     assert deletion_lease.action_name == "delete"
     assert (
         await repository_harness.document_repository.fetch_ready_identifiers(
-            tenant_identifier=document_record.tenant_identifier, embedding_profile=document_record.embedding_profile
+            project_identifier=document_record.project_identifier,
+            tenant_identifier=document_record.tenant_identifier,
+            embedding_profile=document_record.embedding_profile,
         )
         == ()
     )
@@ -736,7 +1037,9 @@ async def test_profile_change_allows_new_job_with_same_content(repository_harnes
     assert new_document.state_name is entities.DocumentState.QUEUED
     assert (
         await repository_harness.document_repository.fetch_ready_identifiers(
-            tenant_identifier=old_document.tenant_identifier, embedding_profile=new_profile
+            project_identifier=old_document.project_identifier,
+            tenant_identifier=old_document.tenant_identifier,
+            embedding_profile=new_profile,
         )
         == ()
     )
@@ -746,10 +1049,14 @@ async def test_profile_change_allows_new_job_with_same_content(repository_harnes
     )
     await repository_harness.document_repository.complete_indexing(document_lease=new_lease)
     assert await repository_harness.document_repository.fetch_ready_identifiers(
-        tenant_identifier=old_document.tenant_identifier, embedding_profile=new_profile
+        project_identifier=old_document.project_identifier,
+        tenant_identifier=old_document.tenant_identifier,
+        embedding_profile=new_profile,
     ) == (new_document.document_identifier,)
     assert await repository_harness.document_repository.fetch_ready_identifiers(
-        tenant_identifier=old_document.tenant_identifier, embedding_profile=old_document.embedding_profile
+        project_identifier=old_document.project_identifier,
+        tenant_identifier=old_document.tenant_identifier,
+        embedding_profile=old_document.embedding_profile,
     ) == (old_document.document_identifier,)
     foreign_account = await create_test_account(repository_harness)
     foreign_document = await repository_harness.document_repository.register_document(
@@ -759,7 +1066,8 @@ async def test_profile_change_allows_new_job_with_same_content(repository_harnes
     assert foreign_document.document_identifier != new_document.document_identifier
     with pytest.raises(errors.ResourceNotFoundError):
         await repository_harness.document_repository.fetch_document(
-            tenant_identifier=foreign_account.user_identifier, document_identifier=new_document.document_identifier
+            tenant_identifier=foreign_account.user_identifier,
+            document_identifier=new_document.document_identifier,
         )
 
 
@@ -773,11 +1081,52 @@ async def test_profile_dedup_migration_preserves_existing_data(
     auth_repository = PostgreSQLAuthRepository(session_factory=session_factory)
     document_repository = PostgreSQLDocumentRepository(session_factory=session_factory)
     old_account = await auth_repository.create_account(
-        email_address="migration@example.test", password_hash="fixture-hash"
+        login_name="migration@example.test", password_hash="fixture-hash"
     )
-    old_document = await document_repository.register_document(
-        tenant_identifier=old_account.user_identifier, document_registration=document_registration()
-    )
+    old_registration = document_registration()
+    timestamp_value = datetime.datetime.now(datetime.UTC)
+    async with empty_database_engine.begin() as connection:
+        await connection.execute(
+            insert(database.DocumentRow).values(
+                document_identifier=old_registration.document_identifier,
+                tenant_identifier=old_account.user_identifier,
+                filename_text=old_registration.filename_text,
+                media_type=old_registration.media_type,
+                storage_key=old_registration.storage_key,
+                content_digest=old_registration.content_digest,
+                byte_count=old_registration.byte_count,
+                embedding_profile=old_registration.embedding_profile,
+                state_name="queued",
+                chunk_count=0,
+                next_attempt_at=timestamp_value,
+                attempts=0,
+                created_at=timestamp_value,
+                updated_at=timestamp_value,
+            )
+        )
+        await connection.execute(
+            insert(
+                table(
+                    "chat_sessions",
+                    *[
+                        column(column_name)
+                        for column_name in (
+                            "chat_identifier",
+                            "tenant_identifier",
+                            "title_text",
+                            "created_at",
+                            "updated_at",
+                        )
+                    ],
+                )
+            ).values(
+                chat_identifier=uuid.uuid4(),
+                tenant_identifier=old_account.user_identifier,
+                title_text="Existing chat",
+                created_at=timestamp_value,
+                updated_at=timestamp_value,
+            )
+        )
     database_resources = resources_for_test_engine(database_engine=empty_database_engine, monkeypatch=monkeypatch)
     assert not await database_resources.check_readiness()
 
@@ -786,12 +1135,21 @@ async def test_profile_dedup_migration_preserves_existing_data(
 
     assert await database_resources.check_readiness()
     assert await auth_repository.fetch_by_identifier(user_identifier=old_account.user_identifier) == old_account
-    assert (
-        await document_repository.fetch_document(
-            tenant_identifier=old_account.user_identifier, document_identifier=old_document.document_identifier
-        )
-        == old_document
+    old_document = await document_repository.fetch_document(
+        tenant_identifier=old_account.user_identifier,
+        document_identifier=old_registration.document_identifier,
     )
+    assert old_document.filename_text == old_registration.filename_text
+    assert old_document.content_digest == old_registration.content_digest
+    assert old_document.storage_key == old_registration.storage_key
+    assert old_document.state_name == entities.DocumentState.QUEUED
+    old_chats = await PostgreSQLConversationRepository(session_factory=session_factory).list_chats(
+        tenant_identifier=old_account.user_identifier,
+        limit_count=50,
+        offset_value=0,
+    )
+    assert len(old_chats.items) == 1
+    assert old_chats.items[0].project_identifier == old_document.project_identifier
     new_document = await document_repository.register_document(
         tenant_identifier=old_account.user_identifier,
         document_registration=dataclasses.replace(document_registration(), embedding_profile="migration-new-profile"),

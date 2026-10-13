@@ -28,7 +28,12 @@ class DocumentService:
     maximum_upload_bytes: int
 
     async def upload_document(
-        self, *, tenant_identity: entities.TenantIdentity, filename_text: str, content_bytes: bytes
+        self,
+        *,
+        tenant_identity: entities.TenantIdentity,
+        filename_text: str,
+        content_bytes: bytes,
+        project_identifier: uuid.UUID | None = None,
     ) -> entities.DocumentRecord:
         normalized_filename: typing.Final = self._normalize_filename(filename_text=filename_text)
         document_media: typing.Final = self._resolve_media_type(filename_text=normalized_filename)
@@ -48,6 +53,7 @@ class DocumentService:
             content_digest=stored_upload.content_digest,
             byte_count=stored_upload.byte_count,
             embedding_profile=self.embedding_provider.embedding_profile,
+            project_identifier=project_identifier,
         )
         try:
             document_record: typing.Final = await self.document_repository.register_document(
@@ -72,10 +78,18 @@ class DocumentService:
         )
 
     async def list_documents(
-        self, *, tenant_identity: entities.TenantIdentity, limit_count: int, offset_value: int
+        self,
+        *,
+        tenant_identity: entities.TenantIdentity,
+        limit_count: int,
+        offset_value: int,
+        project_identifier: uuid.UUID | None = None,
     ) -> entities.PageResult[entities.DocumentRecord]:
         return await self.document_repository.list_documents(
-            tenant_identifier=tenant_identity.user_identifier, limit_count=limit_count, offset_value=offset_value
+            tenant_identifier=tenant_identity.user_identifier,
+            limit_count=limit_count,
+            offset_value=offset_value,
+            project_identifier=project_identifier,
         )
 
     async def fetch_chunk(

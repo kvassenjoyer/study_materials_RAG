@@ -2,12 +2,16 @@ import datetime
 import typing
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from study_rag.adapters import database
 from study_rag.adapters.repositories import mapping
+from study_rag.adapters.repositories.projects import resolve_project
 from study_rag.domain import entities, errors
+
+
+_AUTOMATIC_TITLE_CHARACTERS: typing.Final = 76
 
 
 @typing.final
@@ -15,19 +19,77 @@ class PostgreSQLConversationRepository:
     def __init__(self, *, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_scope = database.PostgreSQLSessionScope(session_factory=session_factory)
 
-    async def create_chat(self, *, tenant_identifier: uuid.UUID, title_text: str) -> entities.ChatRecord:
+    async def create_chat(
+        self,
+        *,
+        tenant_identifier: uuid.UUID,
+        title_text: str | None = None,
+        project_identifier: uuid.UUID | None = None,
+    ) -> entities.ChatRecord:
+        async with self._session_scope.transaction_session() as database_session:
+            project_row = await resolve_project(
+                database_session=database_session,
+                tenant_identifier=tenant_identifier,
+                project_identifier=project_identifier,
+            )
         timestamp_value: typing.Final = datetime.datetime.now(datetime.UTC)
         session_row: typing.Final = database.ChatSessionRow(
             chat_identifier=uuid.uuid4(),
             tenant_identifier=tenant_identifier,
-            title_text=title_text,
+            project_identifier=project_row.project_identifier,
+            title_text=title_text or "Новый чат",
+            automatic_title=title_text is None,
             created_at=timestamp_value,
             updated_at=timestamp_value,
         )
         async with self._session_scope.transaction_session() as database_session:
+            await resolve_project(
+                database_session=database_session,
+                tenant_identifier=tenant_identifier,
+                project_identifier=session_row.project_identifier,
+            )
             database_session.add(session_row)
             await database_session.flush()
         return mapping.chat_record(session_row)
+
+    async def rename_chat(
+        self, *, tenant_identifier: uuid.UUID, chat_identifier: uuid.UUID, title_text: str
+    ) -> entities.ChatRecord:
+        async with self._session_scope.transaction_session() as database_session:
+            session_row = await self._owned_chat(
+                database_session=database_session,
+                tenant_identifier=tenant_identifier,
+                chat_identifier=chat_identifier,
+                lock_required=True,
+            )
+            session_row.title_text = title_text
+            session_row.automatic_title = False
+            session_row.updated_at = datetime.datetime.now(datetime.UTC)
+            await database_session.flush()
+            return mapping.chat_record(session_row)
+
+    async def delete_chat(self, *, tenant_identifier: uuid.UUID, chat_identifier: uuid.UUID) -> None:
+        async with self._session_scope.transaction_session() as database_session:
+            session_row = await self._owned_chat(
+                database_session=database_session,
+                tenant_identifier=tenant_identifier,
+                chat_identifier=chat_identifier,
+                lock_required=True,
+            )
+            session_row.deleted_at = datetime.datetime.now(datetime.UTC)
+            session_row.updated_at = session_row.deleted_at
+            await database_session.execute(
+                delete(database.ChatMessageRow).where(
+                    database.ChatMessageRow.chat_identifier == chat_identifier,
+                    database.ChatMessageRow.tenant_identifier == tenant_identifier,
+                )
+            )
+            await database_session.execute(
+                delete(database.ChatTurnRow).where(
+                    database.ChatTurnRow.chat_identifier == chat_identifier,
+                    database.ChatTurnRow.tenant_identifier == tenant_identifier,
+                )
+            )
 
     async def fetch_chat(self, *, tenant_identifier: uuid.UUID, chat_identifier: uuid.UUID) -> entities.ChatRecord:
         async with self._session_scope.reading_session() as database_session:
@@ -44,18 +106,31 @@ class PostgreSQLConversationRepository:
         tenant_identifier: uuid.UUID,
         limit_count: int,
         offset_value: int,
+        project_identifier: uuid.UUID | None = None,
     ) -> entities.PageResult[entities.ChatRecord]:
+        async with self._session_scope.transaction_session() as database_session:
+            project_row = await resolve_project(
+                database_session=database_session,
+                tenant_identifier=tenant_identifier,
+                project_identifier=project_identifier,
+            )
         async with self._session_scope.reading_session() as database_session:
             total_count: typing.Final = await database_session.scalar(
                 select(func.count())
                 .select_from(database.ChatSessionRow)
                 .where(
                     database.ChatSessionRow.tenant_identifier == tenant_identifier,
+                    database.ChatSessionRow.project_identifier == project_row.project_identifier,
+                    database.ChatSessionRow.deleted_at.is_(None),
                 ),
             )
             session_rows: typing.Final = await database_session.scalars(
                 select(database.ChatSessionRow)
-                .where(database.ChatSessionRow.tenant_identifier == tenant_identifier)
+                .where(
+                    database.ChatSessionRow.tenant_identifier == tenant_identifier,
+                    database.ChatSessionRow.project_identifier == project_row.project_identifier,
+                    database.ChatSessionRow.deleted_at.is_(None),
+                )
                 .order_by(database.ChatSessionRow.created_at, database.ChatSessionRow.chat_identifier)
                 .offset(offset_value)
                 .limit(limit_count),
@@ -152,7 +227,7 @@ class PostgreSQLConversationRepository:
     ) -> entities.TurnRecord:
         timestamp_value: typing.Final = datetime.datetime.now(datetime.UTC)
         async with self._session_scope.transaction_session() as database_session:
-            await self._owned_chat(
+            session_row = await self._owned_chat(
                 database_session=database_session,
                 tenant_identifier=tenant_identifier,
                 chat_identifier=chat_identifier,
@@ -192,6 +267,15 @@ class PostgreSQLConversationRepository:
                 one_active_turn.error_code = "turn_lease_expired"
                 one_active_turn.lease_identifier = None
                 one_active_turn.lease_expires_at = None
+            if session_row.automatic_title:
+                normalized_question = " ".join(question_text.split())
+                session_row.title_text = (
+                    normalized_question
+                    if len(normalized_question) <= _AUTOMATIC_TITLE_CHARACTERS
+                    else normalized_question[: _AUTOMATIC_TITLE_CHARACTERS - 1].rstrip() + "…"
+                )
+                session_row.automatic_title = False
+            session_row.updated_at = timestamp_value
             turn_row: typing.Final = await self._reserve_request(
                 database_session=database_session,
                 previous_turn=previous_turn,
@@ -265,12 +349,16 @@ class PostgreSQLConversationRepository:
         error_code: str,
     ) -> None:
         async with self._session_scope.transaction_session() as database_session:
-            await self._owned_chat(
-                database_session=database_session,
-                tenant_identifier=tenant_identifier,
-                chat_identifier=turn_record.chat_identifier,
-                lock_required=True,
+            session_row = await database_session.scalar(
+                select(database.ChatSessionRow)
+                .where(
+                    database.ChatSessionRow.tenant_identifier == tenant_identifier,
+                    database.ChatSessionRow.chat_identifier == turn_record.chat_identifier,
+                )
+                .with_for_update()
             )
+            if session_row is None or session_row.deleted_at is not None:
+                return
             turn_row: typing.Final = await database_session.scalar(
                 select(database.ChatTurnRow)
                 .where(
@@ -345,6 +433,7 @@ class PostgreSQLConversationRepository:
         select_statement = select(database.ChatSessionRow).where(
             database.ChatSessionRow.tenant_identifier == tenant_identifier,
             database.ChatSessionRow.chat_identifier == chat_identifier,
+            database.ChatSessionRow.deleted_at.is_(None),
         )
         session_row: typing.Final = await database_session.scalar(
             select_statement.with_for_update() if lock_required else select_statement,

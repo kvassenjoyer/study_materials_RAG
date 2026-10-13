@@ -16,7 +16,7 @@ class ResponseModel(pydantic.BaseModel):
 @typing.final
 class CredentialsRequest(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
-    email_address: pydantic.EmailStr
+    login_name: str = pydantic.Field(min_length=1, max_length=320)
     password_text: str = pydantic.Field(min_length=12, max_length=128)
 
 
@@ -30,7 +30,7 @@ class AuthResponse(ResponseModel):
 @typing.final
 class IdentityResponse(ResponseModel):
     user_identifier: uuid.UUID
-    email_address: str
+    login_name: str
 
 
 @typing.final
@@ -44,6 +44,7 @@ class PageResponse[RecordType](ResponseModel):
 @typing.final
 class DocumentResponse(ResponseModel):
     document_identifier: uuid.UUID
+    project_identifier: uuid.UUID
     filename_text: str
     media_type: str
     byte_count: int
@@ -91,12 +92,28 @@ class CitationResponse(ResponseModel):
 @typing.final
 class ChatRequest(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
-    title_text: str = pydantic.Field(default="Новый чат", min_length=1, max_length=200)
+    title_text: str | None = pydantic.Field(default=None, min_length=1, max_length=200)
+    project_identifier: uuid.UUID | None = None
 
 
 @typing.final
 class ChatResponse(ResponseModel):
     chat_identifier: uuid.UUID
+    project_identifier: uuid.UUID
+    title_text: str
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+
+
+@typing.final
+class ProjectRequest(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+    title_text: str = pydantic.Field(min_length=1, max_length=200)
+
+
+@typing.final
+class ProjectResponse(ResponseModel):
+    project_identifier: uuid.UUID
     title_text: str
     created_at: datetime.datetime
     updated_at: datetime.datetime

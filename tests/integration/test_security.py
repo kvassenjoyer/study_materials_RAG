@@ -25,7 +25,7 @@ def test_argon_hash_verifies_only_original_password() -> None:
 
 def test_access_token_roundtrip_contains_required_claims() -> None:
     token_codec = JwtAccessTokenCodec(secret_value=_TOKEN_SECRET)
-    tenant_identity = entities.TenantIdentity(user_identifier=uuid.uuid4(), email_address="learner@example.test")
+    tenant_identity = entities.TenantIdentity(user_identifier=uuid.uuid4(), login_name="learner@example.test")
 
     auth_token = token_codec.issue_token(tenant_identity=tenant_identity)
 

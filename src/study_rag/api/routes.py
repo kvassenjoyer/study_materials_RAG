@@ -13,6 +13,7 @@ from study_rag.domain import errors
 api_router: typing.Final = fastapi.APIRouter(prefix="/rest/study-rag")
 type LimitParameter = typing.Annotated[int, fastapi.Query(alias="limit", ge=1, le=100)]
 type OffsetParameter = typing.Annotated[int, fastapi.Query(alias="offset", ge=0)]
+type ProjectParameter = typing.Annotated[uuid.UUID | None, fastapi.Query(alias="project_identifier")]
 
 
 @api_router.post("/users/", response_model=schemas.AuthResponse, status_code=201, tags=["authentication"])
@@ -20,7 +21,7 @@ async def register_account(
     *, credentials_request: schemas.CredentialsRequest, application_resources: dependencies.CurrentResources
 ) -> schemas.AuthResponse:
     account_token: typing.Final = await application_resources.authentication_service.register_account(
-        email_address=str(credentials_request.email_address), password_text=credentials_request.password_text
+        login_name=str(credentials_request.login_name), password_text=credentials_request.password_text
     )
     return schemas.AuthResponse.model_validate(account_token)
 
@@ -30,7 +31,7 @@ async def login_account(
     *, credentials_request: schemas.CredentialsRequest, application_resources: dependencies.CurrentResources
 ) -> schemas.AuthResponse:
     account_token: typing.Final = await application_resources.authentication_service.login_account(
-        email_address=str(credentials_request.email_address), password_text=credentials_request.password_text
+        login_name=str(credentials_request.login_name), password_text=credentials_request.password_text
     )
     return schemas.AuthResponse.model_validate(account_token)
 
@@ -46,6 +47,7 @@ async def upload_document(
     tenant_identity: dependencies.CurrentIdentity,
     application_resources: dependencies.CurrentResources,
     uploaded_file: typing.Annotated[fastapi.UploadFile, fastapi.File(alias="file")],
+    project_identifier: ProjectParameter = None,
 ) -> schemas.DocumentResponse:
     upload_limit: typing.Final = application_resources.settings.maximum_upload_bytes
     content_buffer: typing.Final = bytearray()
@@ -60,6 +62,7 @@ async def upload_document(
             tenant_identity=tenant_identity,
             filename_text=uploaded_file.filename or "",
             content_bytes=bytes(content_buffer),
+            project_identifier=project_identifier,
         )
         return schemas.DocumentResponse.model_validate(document_record)
     finally:
@@ -73,9 +76,13 @@ async def list_documents(
     application_resources: dependencies.CurrentResources,
     limit_count: LimitParameter = 50,
     offset_value: OffsetParameter = 0,
+    project_identifier: ProjectParameter = None,
 ) -> schemas.PageResponse[schemas.DocumentResponse]:
     document_page: typing.Final = await application_resources.document_service.list_documents(
-        tenant_identity=tenant_identity, limit_count=limit_count, offset_value=offset_value
+        tenant_identity=tenant_identity,
+        limit_count=limit_count,
+        offset_value=offset_value,
+        project_identifier=project_identifier,
     )
     return schemas.PageResponse[schemas.DocumentResponse](
         items=tuple(
@@ -123,7 +130,8 @@ async def retry_document(
     application_resources: dependencies.CurrentResources,
 ) -> schemas.DocumentResponse:
     document_record: typing.Final = await application_resources.document_service.retry_document(
-        tenant_identity=tenant_identity, document_identifier=indexing_request.document_identifier
+        tenant_identity=tenant_identity,
+        document_identifier=indexing_request.document_identifier,
     )
     return schemas.DocumentResponse.model_validate(document_record)
 
@@ -159,7 +167,9 @@ async def create_chat(
     application_resources: dependencies.CurrentResources,
 ) -> schemas.ChatResponse:
     chat_record: typing.Final = await application_resources.conversation_service.create_chat(
-        tenant_identity=tenant_identity, title_text=chat_request.title_text
+        tenant_identity=tenant_identity,
+        title_text=chat_request.title_text,
+        project_identifier=chat_request.project_identifier,
     )
     return schemas.ChatResponse.model_validate(chat_record)
 
@@ -171,9 +181,13 @@ async def list_chats(
     application_resources: dependencies.CurrentResources,
     limit_count: LimitParameter = 50,
     offset_value: OffsetParameter = 0,
+    project_identifier: ProjectParameter = None,
 ) -> schemas.PageResponse[schemas.ChatResponse]:
     chat_page: typing.Final = await application_resources.conversation_service.list_chats(
-        tenant_identity=tenant_identity, limit_count=limit_count, offset_value=offset_value
+        tenant_identity=tenant_identity,
+        limit_count=limit_count,
+        offset_value=offset_value,
+        project_identifier=project_identifier,
     )
     return schemas.PageResponse[schemas.ChatResponse](
         items=tuple(schemas.ChatResponse.model_validate(chat_record) for chat_record in chat_page.items),
@@ -181,6 +195,66 @@ async def list_chats(
         offset=chat_page.offset_value,
         limit=chat_page.limit_count,
     )
+
+
+@api_router.patch("/chats/{chat_identifier}/", response_model=schemas.ChatResponse, tags=["chats"])
+async def rename_chat(
+    *,
+    chat_identifier: uuid.UUID,
+    title_request: schemas.ProjectRequest,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> schemas.ChatResponse:
+    chat_record = await application_resources.conversation_service.rename_chat(
+        tenant_identity=tenant_identity,
+        chat_identifier=chat_identifier,
+        title_text=title_request.title_text,
+    )
+    return schemas.ChatResponse.model_validate(chat_record)
+
+
+@api_router.delete("/chats/{chat_identifier}/", status_code=204, tags=["chats"])
+async def delete_chat(
+    *,
+    chat_identifier: uuid.UUID,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> fastapi.Response:
+    await application_resources.conversation_service.delete_chat(
+        tenant_identity=tenant_identity,
+        chat_identifier=chat_identifier,
+    )
+    return fastapi.Response(status_code=204)
+
+
+@api_router.patch("/projects/{project_identifier}/", response_model=schemas.ProjectResponse, tags=["projects"])
+async def rename_project(
+    *,
+    project_identifier: uuid.UUID,
+    title_request: schemas.ProjectRequest,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> schemas.ProjectResponse:
+    project_record = await application_resources.project_service.rename_project(
+        tenant_identity=tenant_identity,
+        project_identifier=project_identifier,
+        title_text=title_request.title_text,
+    )
+    return schemas.ProjectResponse.model_validate(project_record)
+
+
+@api_router.delete("/projects/{project_identifier}/", status_code=204, tags=["projects"])
+async def delete_project(
+    *,
+    project_identifier: uuid.UUID,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> fastapi.Response:
+    await application_resources.project_service.delete_project(
+        tenant_identity=tenant_identity,
+        project_identifier=project_identifier,
+    )
+    return fastapi.Response(status_code=204)
 
 
 @api_router.get("/chats/{chat_identifier}/", response_model=schemas.ChatResponse, tags=["chats"])
@@ -233,6 +307,55 @@ async def answer_question(
         question_text=question_request.question_text,
     )
     return schemas.AnswerResponse.model_validate(answer_record)
+
+
+@api_router.post("/projects/", response_model=schemas.ProjectResponse, status_code=201, tags=["projects"])
+async def create_project(
+    *,
+    project_request: schemas.ProjectRequest,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> schemas.ProjectResponse:
+    project_record = await application_resources.project_service.create_project(
+        tenant_identity=tenant_identity,
+        title_text=project_request.title_text,
+    )
+    return schemas.ProjectResponse.model_validate(project_record)
+
+
+@api_router.get("/projects/", response_model=schemas.PageResponse[schemas.ProjectResponse], tags=["projects"])
+async def list_projects(
+    *,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+    limit_count: LimitParameter = 50,
+    offset_value: OffsetParameter = 0,
+) -> schemas.PageResponse[schemas.ProjectResponse]:
+    project_page = await application_resources.project_service.list_projects(
+        tenant_identity=tenant_identity,
+        limit_count=limit_count,
+        offset_value=offset_value,
+    )
+    return schemas.PageResponse[schemas.ProjectResponse](
+        items=tuple(schemas.ProjectResponse.model_validate(project_record) for project_record in project_page.items),
+        total_count=project_page.total_count,
+        offset=project_page.offset_value,
+        limit=project_page.limit_count,
+    )
+
+
+@api_router.get("/projects/{project_identifier}/", response_model=schemas.ProjectResponse, tags=["projects"])
+async def fetch_project(
+    *,
+    project_identifier: uuid.UUID,
+    tenant_identity: dependencies.CurrentIdentity,
+    application_resources: dependencies.CurrentResources,
+) -> schemas.ProjectResponse:
+    project_record = await application_resources.project_service.fetch_project(
+        tenant_identity=tenant_identity,
+        project_identifier=project_identifier,
+    )
+    return schemas.ProjectResponse.model_validate(project_record)
 
 
 @api_router.get("/health/", response_model=schemas.HealthResponse, tags=["health"])

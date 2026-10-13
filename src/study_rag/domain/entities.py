@@ -27,14 +27,14 @@ class DocumentState(enum.StrEnum):
 @dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
 class TenantIdentity:
     user_identifier: uuid.UUID
-    email_address: str
+    login_name: str
 
 
 @typing.final
 @dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
 class UserAccount:
     user_identifier: uuid.UUID
-    email_address: str
+    login_name: str
     password_hash: str
     created_at: datetime.datetime
 
@@ -74,6 +74,7 @@ class DocumentRegistration:
     content_digest: str
     byte_count: int
     embedding_profile: str
+    project_identifier: uuid.UUID | None = None
 
 
 @typing.final
@@ -81,6 +82,7 @@ class DocumentRegistration:
 class DocumentRecord:
     document_identifier: uuid.UUID
     tenant_identifier: uuid.UUID
+    project_identifier: uuid.UUID
     filename_text: str
     media_type: str
     storage_key: str
@@ -171,6 +173,17 @@ class CitationRecord:
 @dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
 class ChatRecord:
     chat_identifier: uuid.UUID
+    tenant_identifier: uuid.UUID
+    project_identifier: uuid.UUID
+    title_text: str
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+
+
+@typing.final
+@dataclasses.dataclass(kw_only=True, slots=True, frozen=True)
+class ProjectRecord:
+    project_identifier: uuid.UUID
     tenant_identifier: uuid.UUID
     title_text: str
     created_at: datetime.datetime
