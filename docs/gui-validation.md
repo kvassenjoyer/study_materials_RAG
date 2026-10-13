@@ -1,92 +1,60 @@
-# Проверка GUI Mini-RAG
+# Проверка GUI и документации
 
-Дата: 4 октября 2026 года. Реализован браузерный интерфейс из
-[архитектуры GUI](frontend-architecture.md): React + TypeScript + Vite,
-официальный `@ag-ui/client==1.0.1` и Pydantic AI
-`AGUIAdapter` из `pydantic-ai-slim[ag-ui]==2.54.0`.
-Инференс остаётся локальным через существующий RAG-сценарий и Ollama.
+Дата: **13 октября 2026 года**. Текущее поведение описано в [frontend-architecture.md](frontend-architecture.md), действия пользователя - в [user-guide.md](user-guide.md)
 
 ## Автоматические проверки
 
-| Проверка | Результат | Граница проверки |
-| --- | --- | --- |
-| Полный pytest | 126 passed, без skipped/failed | Отдельная PostgreSQL test DB; HF offline; модельная граница подготовлена тестами |
-| Ruff ALL и форматирование | Passed; форматирование проверило 70 файлов | Python-код и правила проекта |
-| Strict mypy | Passed, 59 файлов | Строгая проверка типов |
-| flake8 COP | Passed | Правила из предоставленного архива с явными исключениями проекта |
-| Frontend Vitest | 11 passed | REST/AG-UI transport, сохранение UUID, stale callbacks, безопасный Markdown |
-| TypeScript + Vite build | Passed | Production assets в `src/study_rag/web` |
-| Python wheel | Web assets включены | `index.html`, favicon, CSS и JS; `.env` и приватный cache не включены |
+| Проверка | Результат |
+| --- | --- |
+| Vitest, отдельный последовательный повтор | **49 passed**, 6 файлов |
+| TypeScript tsc --noEmit | PASS в npm run build |
+| Production Vite build | PASS, 316 modules |
+| Полный backend pytest | 254 passed; подробности [backend](backend-validation.md) |
 
-AG-UI tests используют настоящий adapter и заменяют `ConversationService` на
-границе. Они проверяют lifecycle, ограничения тела и протокола, авторизацию,
-отмену и безопасные ошибки. История, replay, tenant isolation, индексация и
-удаление проверяются также сценарными и repository/API tests.
-Обычный pytest сам по себе не подтверждает настоящий инференс.
+В первом прогоне, одновременно с Python checks, один AG-UI test превысил 5-секундный timeout: 48 passed / 1 failed. Отдельный повтор всей frontend suite завершился 49 passed за 429 мс. Причина первоначального таймаута в этой документационной задаче не диагностировалась, код/таймаут теста не изменялись
 
-Для повторения frontend checks:
+Build сохраняет предупреждение о JS chunk больше 500 kB; сборка завершилась успешно. Это не измерение времени загрузки интерфейса или performance benchmark
 
-```sh
-npm --prefix frontend ci
-npm --prefix frontend test
-npm --prefix frontend run build
-```
+Локальные Node.js 24.17.0 / npm 11.13.0. CI/Dockerfile используют Node.js 26. Команды: npm --prefix frontend test и npm --prefix frontend run build
 
-Python-команды и настройка отдельной test DB описаны в [ci.md](ci.md).
-Проверенный wheel создан в
-`.local/gui-validation/dist/study_materials_rag-0.1.0-py3-none-any.whl`.
+Vitest покрывает REST payload/error/pagination contracts, официальный HttpAgent lifecycle/UUID, stale callbacks, безопасный Markdown/TeX, indexing progress, статусы и duration. Это не полный end-to-end браузерный прогон
 
-## Настоящая проверка в браузере
+## Свежая браузерная проверка PDF
 
-Production GUI проверен на отдельном сервере `127.0.0.1:8001` с отдельной БД
-`study_rag_gui_validation` и изолированными локальными данными.
-Работающий пользовательский API на порту 8000 не перезапускался.
-После проверки тестовый API на 8001 корректно остановлен, браузерная вкладка
-закрыта и viewport восстановлен. Дополнительный API или Vite server не оставлен.
+Production assets проверены в headless Edge через Playwright. API-ответы контролировались runner, использовались байты реального двухстраничного PDF; отдельный static server слушал 8766 и остановлен после проверки
 
-Проверенные действия и наблюдаемые результаты:
+Подтверждено:
 
-1. `/`, JavaScript, CSS и favicon вернули 200. Вход в тестовый аккаунт открыл библиотеку.
-2. Через GUI загружен
-   [gradient-descent-ru.md](../examples/materials/gradient-descent-ru.md).
-   Upload вернул 202; после индексации интерфейс показал «Готов».
-3. Создан чат. Вопрос через официальный `HttpAgent → AGUIAdapter →
-   FunctionModel → ConversationService` получил настоящий ответ Ollama с источником S1.
-4. Уточняющий вопрос отправлен клавишей Enter. Ответ содержал численный шаг
-   `4 − 0.1 × 8 = 3.2`, изменение значения функции `16 → 10.24` и источник S2.
-5. Карточка источника открыла полный защищённый chunk в панели внутри интерфейса.
-6. После обновления страницы сохранились два вопроса, два ответа и citations.
-7. Выход и повторный вход восстановили ту же библиотеку и чат.
-8. Проверены мобильное меню и переход к desktop layout; viewport возвращён
-   в исходное состояние. Console warnings/errors в этом сценарии отсутствовали.
+- По умолчанию выбран **«Текстовый фрагмент»**, а не оригинал PDF
+- Переключение на оригинал, страницы 1/2, правильное отключение prev/next
+- Authenticated fetch с Bearer, viewer получает blob URL без токена
+- Одна загрузка PDF на диалог, без повторной загрузки при смене вкладки
+- Исправленный многострочный текст и KaTeX без katex-error
+- Fallback текста при недоступном PDF
+- Просмотр оригинала при недоступном историческом chunk и показ сохранённого excerpt
+- Отсутствие переполнения dialog на viewport 390/320 px и ошибок JavaScript
 
-Локальные снимки результата сохранены в `.local/gui-preview.jpg` и
-`.local/gui-source-preview.jpg`; `.local` исключён из Git.
+Визуально проверена оригинальная страница в браузерном viewer и текстовый режим. Это подтверждает взаимодействие текущего PDF UI с контрактами; здесь не выполнялись live login/upload/LLM и не проверялись все браузеры или мобильные платформы
 
-## Границы результата и запуск
+## Ранее проверенные сценарии
 
-Этот браузерный smoke покрывает Markdown upload, вход, чаты, ответы, источники,
-историю и мобильное меню. Через браузер отдельно не проверялись регистрация,
-загрузка TXT/PDF, indexing retry, удаление и expired-session 401.
-Для соответствующего backend поведения есть API/unit/integration evidence;
-предыдущий настоящий smoke с TXT/PDF зафиксирован в
-[backend-validation.md](backend-validation.md).
+В предыдущих этапах были browser-проверки входа/логина, проектов, переименования/удаления, фонового запроса при переключении, темы, progress/math и layout. Некоторые использовали контролируемые API, отдельный ранний smoke - настоящую Ollama и собственные fixtures
 
-Dockerfile и CI обновлены для Node.js 26 и сборки GUI. Контейнерный запуск
-здесь не проверялся. Gated HF weights не загружались и не проверялись настоящим
-инференсом; проверен default Ollama backend. Пользовательского корпуса оценки
-пока нет, accuracy/recall на книгах не измерены. OCR и OpenRouter остаются
-будущими этапами.
+Эти результаты не означают свежий полный end-to-end прогон всех возможностей после каждого последующего изменения. Исходные локальные runner/снимки находятся в .local и не включены в репозиторий; автоматического Playwright CI workflow нет
 
-Для рабочего приложения соберите frontend, синхронизируйте зависимости и
-выполните миграции по [runbook.md](runbook.md). Если прежний API уже запущен
-без `--reload`, остановите его через `Ctrl+C` в его терминале и повторите:
+Реальный PDF API/reindex предыдущего этапа описан в [backend-validation.md](backend-validation.md). Старое наблюдение «PDF по умолчанию» заменено текущим поведением «текст по умолчанию»
 
-```sh
-uv run uvicorn study_rag.main:create_application --factory --host 127.0.0.1 --port 8000 --workers 1
-```
+## Проверка актуальной документации
 
-После этого [корневой адрес](http://127.0.0.1:8000/) открывает GUI,
-[Swagger](http://127.0.0.1:8000/docs) остаётся доступен отдельно.
-Embedded Qdrant требует один процесс приложения; новый экземпляр с той же
-директорией данных запускайте после остановки прежнего.
+В ходе этой задачи автоматически сверены:
+
+- Полный набор REST method/path с OpenAPI, созданной текущим кодом
+- Поля 12 response DTO с Pydantic schemas
+- Все 38 Settings и их значения по умолчанию непосредственно с классом
+- Существование локальных Markdown-ссылок и anchors
+- Баланс fenced blocks, синтаксис PowerShell-примеров и встроенного Python
+- Отсутствие прежнего брендинга, частных macOS-путей и устаревших summaries тестов
+
+Исполняемые examples PowerShell разбирались parser, но не запускали повторную загрузку, удаление или реальные вопросы. Docker/macOS инструкции сверены с конфигурацией и кодом, а не исполнены в текущей Windows-сессии
+
+Обновлены README и все прежние документы docs. Добавлены оглавление, user guide, полный config reference, очередь и PDF. Результаты проверки относятся к текущему снимку; дальнейшие изменения кода требуют повторной сверки

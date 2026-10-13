@@ -1,169 +1,83 @@
-# Локальные модели и проверка адаптеров
+# Локальные модели
 
-Default backend использует локальный Ollama на `http://127.0.0.1:11434`,
-`embeddinggemma:300m` для embeddings и `qwen3.5:4b` для ответов и переформулирования вопросов.
-Никакая модель не подменяется автоматически при ошибке. OpenRouter остаётся этапом финальной
-версии, согласуемым отдельно.
+Текущие adapters: [embeddings.py](../src/study_rag/adapters/embeddings.py), [generation.py](../src/study_rag/adapters/generation.py), [model_support.py](../src/study_rag/adapters/model_support.py), [tokenizer.py](../src/study_rag/adapters/tokenizer.py)
 
-## Проверенный runtime
+## Default: Ollama
 
-На машине пользователя проверены Apple M3 Pro, arm64, 36 GB unified memory, GPU 18 cores
-и Metal. На 2026-10-04 существующий daemon Ollama версии `0.32.14` был доступен через
-`/usr/local/bin/ollama`; отдельный server не запускался. Существующие модели не изменялись.
+| Назначение | Default |
+| --- | --- |
+| Embeddings | embeddinggemma:300m через /api/embed |
+| Планирование, ответы, extraction, review, synonyms | qwen3.5:4b через /api/chat |
+| Tokenizer chunk/generation budgets | Публичный HF Qwen/Qwen3.5-4B |
+| Размерность индекса | 768, фиксируется Settings.vector_dimensions |
+| Адрес Ollama | http://127.0.0.1:11434 |
 
-| Компонент | Точный идентификатор | Артефакт / размер |
-|---|---|---|
-| Embeddings, default | `embeddinggemma:300m` | BF16; ID `85462619ee72`; около 622 MB |
-| Ответы и rewrite | `qwen3.5:4b` | Q4_K_M; ID `2a654d98e6fb`; около 3.4 GB |
-| Chunk / generation tokenizer | `Qwen/Qwen3.5-4B` | Публичный HF `tokenizer.json`, cache `.data/models` |
-| Embeddings, opt-in original HF | `google/embeddinggemma-300m` | Original float32; около 1.2 GB весов; отдельный профиль |
-
-Первичная проверка `/api/ps` показала обе Ollama-модели на GPU: EmbeddingGemma около
-673 MB runtime memory при context 2048, Qwen около 3.38 GB при context 8192. Это наблюдение,
-а не гарантированный верхний предел: приложение задаёт Qwen context 16384, и память также
-зависит от параллелизма и версии runtime. [Ollama поддержка GPU](https://docs.ollama.com/gpu).
-
-Скачивание и повторный запуск:
-
-```sh
-/usr/local/bin/ollama pull embeddinggemma:300m
-/usr/local/bin/ollama pull qwen3.5:4b
-/usr/local/bin/ollama list
+```powershell
+ollama pull embeddinggemma:300m
+ollama pull qwen3.5:4b
+ollama list
 ```
 
-Если daemon выключен, Ollama запускается обычным `ollama serve`. Приложение не запускает
-daemon, не скачивает Ollama-веса и не закрывает общий daemon пользователя.
+Запустите приложение Ollama или `ollama serve` в отдельном терминале. RAGumentation не запускает daemon и не скачивает Ollama-веса. Python скачивает только tokenizer Qwen в model_cache_directory. После кеширования можно включить HF_HUB_OFFLINE=1 для tokenizer
 
-## Prefixes, размеры и усечение
+Идентификаторы моделей должны совпадать с настройками. Startup/readiness проверяет модель через /api/show и её capabilities, а не выполняет пробный ответ. Наличие модели не гарантирует скорость или качество; размер/квантизация и GPU offload зависят от Ollama и установленного артефакта. Старые macOS timings не являются характеристиками Windows
 
-Оба embedding backend форматируют запрос один раз:
+## Embedding input и chunk budgets
+
+Оба backend добавляют prefix ровно один раз:
 
 ```text
-task: search result | query: <question>
-title: <filename> | text: <chunk>
+task: search result | query: вопрос
+title: имя файла | text: текст фрагмента
 ```
 
-Из title удаляются разделитель `|` и лишние пробелы, затем title ограничивается 256 UTF-8
-bytes на границе символа. Это соответствует назначению query/document prefixes из
-[карточки EmbeddingGemma](https://huggingface.co/google/embeddinggemma-300m).
+Title очищается от pipe/лишних пробелов и ограничивается 256 UTF-8 байтами без разрезания символа. Default chunks: до 512 content tokens, overlap 64; страницы PDF не смешиваются
 
-У проверенного Ollama `embeddinggemma:300m` Modelfile содержит `TEMPLATE {{ .Prompt }}`;
-`/api/embed` в этой версии передаёт строки непосредственно в tokenize/embed. Prefixes
-задаются адаптером вручную. Это проверено исходным кодом
-[Ollama EmbedHandler v0.32.14](https://github.com/ollama/ollama/blob/v0.32.14/server/routes.go)
-и разным числом input tokens для raw и prefixed запроса. В HF adapter уже форматированные
-строки передаются в Sentence Transformers с `prompt=""`, чтобы отключить его default query
-prompt и предотвратить повторный prefix.
+В Ollama profile tokenizer Qwen **не является точным tokenizer Gemma**. Поэтому дополнительно действуют content byte limit 1536, formatted byte limit 1900 и проверка formatted token budget 2048. /api/embed вызывается с truncate=false: runtime не должен скрыто обрезать вход
 
-Default размерность — 768; адаптеры также проверяют поддерживаемые Matryoshka размеры
-128/256/512/768. Векторы проверяются на точное число строк, размерность, конечность и
-ненулевую норму, затем L2-нормализуются. Для HF прежде чем обрезать размерность, проверяется
-исходная размерность 768.
+Вопрос также проходит embedding formatted-input проверки. Допустимые HTTP 4000 символов не гарантируют, что очень длинный вопрос поместится в embedding budget
 
-Chunking сохраняет границы PDF-страниц и исходный Unicode-текст. Настройки: максимум 512
-content tokens, overlap 64; tail не теряется. UUID чанка детерминирован от document UUID,
-embedding profile и ordinal. Default Ollama профиль использует публичный Qwen tokenizer
-для chunk/generation budgets; это **не точный tokenizer EmbeddingGemma**. Поэтому дополнительно
-проверяются content <=1536 UTF-8 bytes и formatted input <=1900 bytes, а `/api/embed`
-вызывается с `truncate:false`. Если runtime отвергает вход, адаптер возвращает ошибку,
-без скрытого усечения. [Ollama embed API](https://docs.ollama.com/api/embed).
+Adapters проверяют количество векторов, конечность координат, ненулевую норму и размерность, затем L2-нормализуют. Adapters поддерживают размеры 128/256/512/768, но приложение создаёт только 768-мерный индекс: настройки размерности в .env нет
 
-HF профиль использует собственный EmbeddingGemma tokenizer. Адаптер до encode проверяет
-полный formatted input с special tokens против 2048 и вызывает tokenizer с
-`truncation=False`. HF и Ollama profiles включают разные backend/tokenizer/budgets;
-их индексы не смешиваются. При смене профиля требуется переиндексация.
+## Optional Hugging Face backend
 
-## Original Hugging Face backend
+Для `google/embeddinggemma-300m` нужны доступ к файлам модели и принятие её условий на Hugging Face, если доступ запрашивается. Актуальные условия проверяются пользователем при настройке; документ не фиксирует состояние внешнего gating навсегда
 
-Google repository публично виден, но файлы gated. Публичная проверка HF metadata вернула
-`gated: manual`; unauthenticated HEAD для `tokenizer.json` — HTTP 401. Qwen repository
-вернул `gated: false`. Наличие публичной карточки Google не означает доступ к весам.
-[Google metadata](https://huggingface.co/api/models/google/embeddinggemma-300m),
-[Qwen metadata](https://huggingface.co/api/models/Qwen/Qwen3.5-4B).
-
-Для opt-in HF backend пользователь самостоятельно принимает условия на странице модели
-и при необходимости авторизует HF CLI локально. Секреты не передаются в чаты и не выводятся
-приложением. Установить optional зависимости и выбрать backend можно так:
-
-```sh
-uv sync --extra huggingface
+```powershell
+uv sync --locked --group dev --extra huggingface
+uv run --no-sync hf auth login
 ```
 
-Затем установить `STUDY_RAG_EMBEDDING_BACKEND=huggingface`; полный список settings указан
-в `.env.example`. Device `auto` выбирает MPS, затем CUDA, затем CPU по доступности PyTorch.
-`cpu`, `mps` и `cuda` можно задать явно; недоступный явно выбранный device возвращает
-понятную dependency error. Encode сериализован и вынесен из event loop.
-Sentence Transformers загружает оригинальную модель с `trust_remote_code=False`,
-`torch_dtype=torch.float32`, затем `.float()`. fp16 не используется.
+В .env установите STUDY_RAG_EMBEDDING_BACKEND=huggingface, при необходимости STUDY_RAG_EMBEDDING_DEVICE=cpu/mps/cuda. auto выбирает MPS, затем CUDA, затем CPU по доступности PyTorch; недоступное явно выбранное устройство даёт ошибку
 
-Реальный original HF inference в этой сессии не подтверждён: Google доступ gated, а heavy
-extra не устанавливался. Unit tests проверяют его границы через typed encoder double:
-prefix один раз, точный token cap до encode, native dimensions, normalization, device
-resolution. Default Ollama inference выполнен с реальными скачанными моделями.
+HF использует Gemma tokenizer для chunk/embedding input, а Qwen tokenizer отдельно для генерации. Модель загружается через Sentence Transformers с trust_remote_code=false и float32. Полный formatted input проверяется до encode, truncation=false; default prompt Sentence Transformers отключён, чтобы prefix не добавлялся дважды
 
-## Ответы и история
+HF inference вынесен из event loop и сериализован. Реальный запуск HF-весов не подтверждён текущими обычными тестами: они используют injected encoder/tokenizer doubles. Наличие optional extra в проекте не означает установленный HF runtime на каждой машине
 
-Ответы используют `/api/chat`, `stream:false`, `think:false`, JSON schema, context 16384,
-output 512 и temperature 0.1. История ограничена последними восемью completed сообщениями
-и 2048 tokens. История помогает интерпретировать короткий follow-up, но источником фактов
-служат только переданные excerpts. При нехватке бюджета сначала удаляются целые старые
-сообщения, затем целые последние источники; source labels `S1..S6` сохраняют порядок.
+## Профиль индекса
 
-Без evidence адаптер сразу возвращает RU/EN отказ. Invalid JSON, незавершённый/length
-response, неизвестный inline label или declared label, а также положительный ответ без
-source labels приводят к dependency error и не публикуются как успешный grounded answer.
-После проверки model-declared source labels сервер добавляет отсутствующие inline markers
-`[Sx]` в конец ответа в порядке объявленных labels; повторные labels не дублируются.
-Уже присутствующие markers сохраняются. Это детерминированное форматирование не меняет
-фактический текст и не добавляет новых source IDs; дополнительных model requests нет.
-Это проверки структуры и ссылок; они не доказывают фактическую корректность всех утверждений
-модели. [Ollama chat API](https://docs.ollama.com/api/chat).
+Settings вычисляет embedding_profile из backend, model ID, 768 dimensions, tokenizer, chunk tokens/overlap, byte limits для Ollama и версии prefix policy. Profile digest - первые 16 hex-символов SHA-256 сериализованных настроек
 
-HTTP calls сериализованы внутри каждого adapter transport. Ошибки сети, timeout, HTTP
-429/500/502/503/504 повторяются максимум три раза с небольшим exponential backoff и jitter;
-другие HTTP 4xx не повторяются. Timeout одной попытки <=40 seconds; ожидание очереди и retry
-включены в общий operation budget. Root также ограничивает совокупный пользовательский
-turn, включая rewrite и answer.
+Профиль не содержит generation model, similarity threshold, parser version или digest самих весов. Поэтому смена parser требует явного rebuild; замена весов под прежним тегом не обнаруживается автоматически как смена profile
 
-## Фактические проверки
+Смена backend/model/tokenizer/chunk settings меняет profile. Заново загрузите материалы: одинаковый файл получит новый document UUID и отдельный индекс. Старые документы остаются в списке, но не участвуют в поиске нового profile. Retry/rebuild старого profile не переводит его в новый: worker возвращает embedding_profile_changed
 
-Прямой smoke Ollama API с синтетическими материалами RU/EN подтвердил:
+## Генерация и повторы
 
-- embedding `embeddinggemma:300m`: 768 finite dimensions, unit norm; 256 dimensions также
-  проверены. RU relevant cosine 0.614 против unrelated 0.298; EN 0.591 против 0.388;
-- переполнение входа с `truncate:false` возвращает HTTP 400 `input length exceeds context length`;
-- Qwen `qwen3.5:4b`, `think:false`, structured JSON: RU/EN ответы о хлоропластах, корректный
-  единственный source, `done_reason=stop`, пустой thinking. Cold RU request около 11.7 s,
-  warm EN около 1.1 s на этой машине, около 38 generated tokens/s.
+Chat payload задаёт stream=false, think=false, JSON schema, temperature=0.1, num_ctx=16384 и num_predict=2048 по умолчанию. Обычный grounded JSON ограничен 16000 символами и 48 labels; общий ответ - 4000 символами. Ответ обзора собирается кодом из извлечённых пунктов
 
-После реализации отдельно проверена цепочка production adapters:
-`PypdfDocumentParser -> HuggingFaceTokenizer -> OllamaEmbeddingProvider -> OllamaAnswerGenerator`
-с cached публичным Qwen tokenizer и реальным localhost daemon. RU/EN запросы дали 768
-finite coordinates с norm 1.0, relevant cosine 0.6449/0.6654 и корректные ответы о
-хлоропластах с одной проверенной citation. Использовались только синтетические учебные
-примеры; резюме с личными данными не индексировалось.
+История ограничена числом сообщений application (default 8) и 2048 tokens внутри generator. Бюджет prompt учитывает system/user и резерв шаблона; при переполнении убираются целые старые сообщения, затем последние источники. Не помещающийся вопрос вызывает question_budget_exceeded
 
-После добавления few-shot примеров в rewrite prompt реальный Qwen сохранил тему RU/EN
-follow-up о gradient descent: запрос «Покажи числовой пример из конспекта.» преобразован
-в «Какой числовой пример градиентного спуска приведён в конспекте?». EN запрос также
-включил gradient descent; явный новый вопрос `What is probability?` остался вопросом о
-probability без добавления старой темы. Это проверка трёх конкретных случаев, а не
-оценка качества на полном benchmark.
+При done=true/done_reason=length выполняется один новый запрос с теми же prompt/schema и бюджетом min(2 * output_tokens, доступный остаток контекста), по умолчанию до 4096. Частичный ответ отбрасывается. Повторный length - model_response_truncated, другое незавершение - incomplete_model_response
 
-Также проверена цепочка rewrite -> embed -> retrieve -> generate на синтетическом
-`examples/materials/gradient-descent-ru.md`. Для указанного RU follow-up rewritten query
-содержала gradient descent, scores двух chunks составили 0.5487 и 0.4805, оба превысили
-неизменённый порог 0.35. Grounded answer вернул `w_next = 4 - 0.1 * 8 = 3.2`,
-`sufficient_context=true` и одну валидную citation. Число 3.2 проверено assertion.
+JSON и labels проверяются. Неизвестные источники отклоняются; отсутствующие inline markers для допустимых declared labels добавляются детерминированно. General answer не может объявлять citations
 
-Unit regression suite:
+Ollama transport повторяет сетевые ошибки и HTTP 429/500/502/503/504 до трёх попыток с backoff/jitter; другие HTTP 4xx не повторяются. Generation operation budget, включая ожидание lock, - min(configured timeout, 120 с), embedding attempt timeout - min(generation timeout / 3, 40 с). Общий бюджет обработки turn - 240 с
 
-```sh
-.venv/bin/pytest -q tests/unit/test_file_storage.py tests/unit/test_parser.py \
-  tests/unit/test_tokenizer.py tests/unit/test_embeddings.py tests/unit/test_generation.py
-```
+Смысловая review и synonyms используют ту же модель, увеличивая число вызовов. См. [адаптивный поиск](adaptive-search.md) и [конфигурацию](configuration.md)
 
-Проверяются atomic generated storage paths, traversal/symlink escape, size caps,
-UTF-8/BOM и PDF page mapping, scan/invalid input refusal, Unicode/tail/overlap windows,
-formatted budgets, retry boundaries, dimension/NaN/zero rejection, no-truncation,
-HF device resolution, bounded history/context и citation validation.
+## Проверка
+
+Unit tests покрывают prefixes, no-truncation, dimensions, normalization, device selection, budgets, JSON/labels, length retry и review. Они не измеряют качество на учебниках
+
+`scripts/smoke_local.py` проверяет настоящий сервер на собственных RU/EN материалах, численный follow-up, history, replay, tenant isolation и ответы без источников. Текущий статус результатов и границы: [backend-validation.md](backend-validation.md)
